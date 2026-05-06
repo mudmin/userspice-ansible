@@ -20,7 +20,10 @@ $playbooks = ansible_list_playbooks();
 <div class="container py-4">
     <div class="d-flex justify-content-between align-items-start mb-4">
         <h1 class="mb-0">Ansible UI</h1>
-        <a href="pages/help.php" class="btn btn-outline-secondary btn-sm">Getting started</a>
+        <div class="btn-group btn-group-sm" role="group">
+            <a href="pages/help.php" class="btn btn-outline-secondary">Getting started</a>
+            <a href="https://userspice.com/donate/" target="_blank" rel="noopener" class="btn btn-outline-success">Donate</a>
+        </div>
     </div>
     <p class="text-muted">Repo: <code><?= safeReturn(ANSIBLE_REPO) ?></code></p>
 
