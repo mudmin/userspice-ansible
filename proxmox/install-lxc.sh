@@ -409,14 +409,11 @@ APACHERESTRICT
     a2enconf 99-userspice-ansible-restrict >/dev/null 2>&1 || true
 fi
 
-# Landing page — redirect to the app
+# Apache DocumentRoot points directly at the app (set below in the apache
+# config step) so URLs like /ansible/parsers/run_finish.php resolve to the
+# UserSpice install without symlink gymnastics. Just remove Ubuntu's
+# default landing page.
 rm -f /var/www/html/index.html
-cat > /var/www/html/index.php <<'INDEXPHP'
-<?php
-header('Location: /userspice-ansible/');
-exit;
-INDEXPHP
-chown www-data:www-data /var/www/html/index.php
 
 # Wrapper so users can just type `add-server` instead of remembering the
 # sudo invocation. Re-execs as the ansible user since add_server.sh uses
@@ -501,14 +498,6 @@ find '/var/www/html/${REPO_DIR_NAME}/playbooks' -name '*.py' -exec chmod 775 {} 
 mkdir -p '/var/www/html/${REPO_DIR_NAME}/ansible/runs'
 chown www-data:ansible '/var/www/html/${REPO_DIR_NAME}/ansible/runs'
 chmod 2775 '/var/www/html/${REPO_DIR_NAME}/ansible/runs'
-
-# helper.php hardcodes http://127.0.0.1/ansible/parsers/run_finish.php as
-# the run-finish callback URL. With our DocumentRoot at /var/www/html and
-# the app under /userspice-ansible/, that path 404s — runs would never
-# get finished_at stamped and the UI would poll forever. Symlink the
-# expected path to where the files actually live.
-ln -sfn '/var/www/html/${REPO_DIR_NAME}/ansible' /var/www/html/ansible
-chown -h www-data:www-data /var/www/html/ansible
 "; then
     cleanup_on_fail
     fail "Clone failed."
@@ -551,30 +540,54 @@ chmod 640 config.php
 COMPOSERSCRIPT
 ok "Composer dependencies installed, ansible/config.php rendered"
 
-# ---- Apache: mod_rewrite, .htaccess overrides, deny on playbooks/ ----
-step "Configuring Apache (mod_rewrite, AllowOverride, playbooks deny)"
+# ---- Apache: DocumentRoot, mod_rewrite, AllowOverride, playbook deny ----
+step "Configuring Apache (DocumentRoot + mod_rewrite + AllowOverride + deny)"
 pct exec "$CTID" -- bash <<'APACHECONFIG'
 set -e
 
 # UserSpice ships .htaccess files with rewrite rules — both must be on.
 a2enmod rewrite >/dev/null 2>&1
 
-cat > /etc/apache2/conf-available/99-userspice-ansible-app.conf <<'CONF'
-# Allow UserSpice's .htaccess files to take effect (mod_rewrite rules, etc.)
-<Directory /var/www/html/userspice-ansible>
-    AllowOverride All
-</Directory>
+# Point DocumentRoot at the app directly. UserSpice expects to live at the
+# webroot (its init.php walks up from PHP_SELF looking for z_us_root.php
+# in DOCUMENT_ROOT). With DocumentRoot=/var/www/html the wrapper-callback
+# URL /ansible/parsers/run_finish.php 500s because UserSpice's path
+# detection fails. With DocumentRoot=/var/www/html/userspice-ansible
+# everything lines up.
+cat > /etc/apache2/sites-available/000-default.conf <<'VHOST'
+<VirtualHost *:80>
+    ServerAdmin webmaster@localhost
+    DocumentRoot /var/www/html/userspice-ansible
 
-# Block direct HTTP access to the playbooks tree. PHP exec still reads it
-# fine — only HTTP serving is denied.
+    <Directory /var/www/html/userspice-ansible>
+        Options Indexes FollowSymLinks
+        AllowOverride All
+        Require all granted
+    </Directory>
+
+    ErrorLog ${APACHE_LOG_DIR}/error.log
+    CustomLog ${APACHE_LOG_DIR}/access.log combined
+</VirtualHost>
+VHOST
+
+# Block direct HTTP access to the playbooks tree, db schema, and installer.
+# PHP exec still reads playbooks fine — only HTTP serving is denied.
+cat > /etc/apache2/conf-available/99-userspice-ansible-app.conf <<'CONF'
 <Directory /var/www/html/userspice-ansible/playbooks>
+    Require all denied
+</Directory>
+<Directory /var/www/html/userspice-ansible/db>
+    Require all denied
+</Directory>
+<Directory /var/www/html/userspice-ansible/proxmox>
     Require all denied
 </Directory>
 CONF
 a2enconf 99-userspice-ansible-app >/dev/null 2>&1 || true
+apache2ctl configtest >/dev/null
 systemctl reload apache2
 APACHECONFIG
-ok "mod_rewrite + AllowOverride enabled, playbooks/ HTTP-denied"
+ok "DocumentRoot=/var/www/html/userspice-ansible; mod_rewrite + AllowOverride on; playbooks/db/proxmox denied"
 
 # ---- Database setup, schema import, admin user, init.php render ----
 step "Setting up database, importing schema, configuring admin user"
@@ -684,7 +697,7 @@ echo -e "  MariaDB root:   ${BOLD}${MYSQL_PW}${NC}   (${MYSQL_PW_LABEL})"
 echo -e "  Admin email:    ${BOLD}${ADMIN_EMAIL}${NC}"
 echo -e "  Admin password: ${BOLD}${ADMIN_PW}${NC}   (${ADMIN_PW_LABEL})"
 echo ""
-echo -e "  Web UI:      ${BOLD}http://${CT_IP:-<ip>}/${NC}        (auto-redirects to /${REPO_DIR_NAME}/)"
+echo -e "  Web UI:      ${BOLD}http://${CT_IP:-<ip>}/${NC}"
 echo -e "  phpMyAdmin:  ${BOLD}http://${CT_IP:-<ip>}/phpmyadmin/${NC}   (root / MariaDB password)"
 echo -e "  SSH:         ${BOLD}ssh root@${CT_IP:-<ip>}${NC}"
 echo -e "  Console:     ${BOLD}pct enter ${CTID}${NC}"
