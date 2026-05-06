@@ -1,0 +1,88 @@
+# Fleet Health Report
+
+**Generated:** {{ '%Y-%m-%d %H:%M:%S %Z' | strftime(ansible_facts.date_time.epoch | int) }}
+**Hosts in scope:** {{ ansible_play_hosts_all | length }} ({{ ansible_play_hosts_all | join(', ') }})
+
+{% set ns = namespace(reboot=0, failed=0, kernel_stale=0, unreachable=0) %}
+{% for host in ansible_play_hosts_all | sort %}
+{%- set hv = hostvars[host] -%}
+{% if hv.reboot_flag is not defined %}
+{%   set ns.unreachable = ns.unreachable + 1 %}
+{% else %}
+{%   if hv.reboot_flag.stat.exists %}{% set ns.reboot = ns.reboot + 1 %}{% endif %}
+{%   if (hv.failed_units.stdout | trim) != '' %}{% set ns.failed = ns.failed + 1 %}{% endif %}
+{%   if hv.latest_kernel.stdout != '' and hv.latest_kernel.stdout != hv.ansible_facts.kernel %}{% set ns.kernel_stale = ns.kernel_stale + 1 %}{% endif %}
+{% endif %}
+{% endfor %}
+
+## Summary
+
+| Signal | Count |
+|---|---|
+| Hosts unreachable | {{ ns.unreachable }} |
+| Reboot required | {{ ns.reboot }} |
+| Hosts with failed units | {{ ns.failed }} |
+| Running an outdated kernel | {{ ns.kernel_stale }} |
+
+---
+
+{% for host in ansible_play_hosts_all | sort %}
+{% set hv = hostvars[host] %}
+## {{ host }}
+
+{% if hv.reboot_flag is not defined %}
+**UNREACHABLE** — host did not respond during this run.
+
+---
+
+{% else %}
+- **Address:** `{{ hv.ansible_host | default(host) }}`
+- **OS:** {{ hv.ansible_facts.distribution }} {{ hv.ansible_facts.distribution_version }} ({{ hv.ansible_facts.distribution_release }})
+- **Architecture:** {{ hv.ansible_facts.architecture }}
+- **Uptime:** {{ hv.uptime_pretty.stdout | default('unknown') }}
+- **Reboot required:** {% if hv.reboot_flag.stat.exists %}**YES**{% else %}no{% endif %}
+
+- **Kernel running:** `{{ hv.ansible_facts.kernel }}`
+- **Kernel latest installed:** `{{ hv.latest_kernel.stdout | default('unknown') }}`
+{% if hv.latest_kernel.stdout != '' and hv.latest_kernel.stdout != hv.ansible_facts.kernel %}
+- ⚠️  Newer kernel installed than the one running — reboot to switch to `{{ hv.latest_kernel.stdout }}`.
+{% endif %}
+
+### Memory
+
+| Total | Free | Swap total | Swap free |
+|---|---|---|---|
+| {{ hv.ansible_facts.memtotal_mb }} MB | {{ hv.ansible_facts.memfree_mb }} MB | {{ hv.ansible_facts.swaptotal_mb }} MB | {{ hv.ansible_facts.swapfree_mb }} MB |
+
+### Disk
+
+| Mount | Size | Used | Used % | FS |
+|---|---|---|---|---|
+{% for m in hv.ansible_facts.mounts | sort(attribute='mount') %}
+{%- set used = m.size_total - m.size_available -%}
+{%- set used_pct = (used / m.size_total * 100) | round(1) if m.size_total > 0 else 0 -%}
+| `{{ m.mount }}` | {{ (m.size_total / 1024 / 1024 / 1024) | round(1) }} GB | {{ (used / 1024 / 1024 / 1024) | round(1) }} GB | {{ used_pct }}%{% if used_pct >= 85 %} ⚠️{% endif %} | {{ m.fstype }} |
+{% endfor %}
+
+### Failed systemd units
+
+{% if (hv.failed_units.stdout | trim) == '' %}
+None.
+{% else %}
+```
+{{ hv.failed_units.stdout }}
+```
+{% endif %}
+
+### Unattended upgrades
+
+{% if hv.unattended_log.stat.exists %}
+Last log activity: {{ '%Y-%m-%d %H:%M:%S' | strftime(hv.unattended_log.stat.mtime | int) }}
+{% else %}
+No unattended-upgrades log found.
+{% endif %}
+
+---
+
+{% endif %}
+{% endfor %}

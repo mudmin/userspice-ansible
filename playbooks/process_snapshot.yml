@@ -1,0 +1,88 @@
+---
+# process_snapshot.yml — top N processes by CPU and by RAM, per host. Read-only.
+#
+# UI_PARAMS:
+#   n: int default=10 min=1 max=100
+#
+# Two views per host: top N by %CPU and top N by RSS. The %CPU is ps's
+# cumulative cpu-time/wall-time ratio since the process started (same as
+# top's first-refresh number). For long-running processes that's not the
+# instantaneous CPU; for a snapshot it's the right thing.
+#
+# Runs without become — `ps -eo` reads /proc and doesn't need root.
+#
+# When `ui_report_path` is set, also emits a structured JSON report.
+#
+#   ansible-playbook process_snapshot.yml --limit deploy-spice
+#   ansible-playbook process_snapshot.yml --limit apache -e n=20
+#   ansible-playbook process_snapshot.yml --limit nonprod -e ui_report_path=/tmp/ps.json
+
+- name: Process snapshot
+  hosts: all
+  become: false
+  gather_facts: false
+
+  tasks:
+    - name: Validate parameters
+      ansible.builtin.assert:
+        that:
+          - (n | default(10)) | int >= 1
+          - (n | default(10)) | int <= 100
+        fail_msg: "Invalid n: must be 1..100"
+        quiet: true
+      run_once: true
+      delegate_to: localhost
+
+    - name: Run scripts/process_snapshot.py
+      ansible.builtin.script: "scripts/process_snapshot.py {{ (n | default(10)) | int }}"
+      args:
+        executable: python3
+      register: ps_json
+      changed_when: false
+
+    - name: Stash per-host process record
+      ansible.builtin.set_fact:
+        ps_record: "{{ ps_json.stdout | from_json }}"
+
+    - name: Per-host process summary
+      ansible.builtin.debug:
+        msg: |-
+          === {{ inventory_hostname }} ===
+          Top by CPU:
+          {% for p in ps_record.top_cpu[:5] %}
+          {{ "%-12s" | format(p.user) }}  pid={{ "%-6d" | format(p.pid) }}  cpu={{ "%5.1f" | format(p.pcpu) }}%  rss={{ "%6d" | format((p.rss_kb / 1024) | int) }}M  {{ p.command[:60] }}
+          {% endfor %}
+          Top by RAM:
+          {% for p in ps_record.top_mem[:5] %}
+          {{ "%-12s" | format(p.user) }}  pid={{ "%-6d" | format(p.pid) }}  cpu={{ "%5.1f" | format(p.pcpu) }}%  rss={{ "%6d" | format((p.rss_kb / 1024) | int) }}M  {{ p.command[:60] }}
+          {% endfor %}
+
+  post_tasks:
+    - name: Emit structured process_snapshot report for the UI
+      delegate_to: localhost
+      become: false
+      run_once: true
+      check_mode: false
+      when: ui_report_path is defined
+      ansible.builtin.copy:
+        dest: "{{ ui_report_path }}"
+        mode: "0644"
+        content: |-
+          {
+            "report_type": "process_snapshot",
+            "generated_at": {{ lookup('pipe', 'date -u +%FT%TZ') | to_json }},
+            "params": {
+              "n": {{ (n | default(10)) | int }}
+            },
+            "hosts": [
+              {%- for h in ansible_play_hosts_all | sort %}
+              {%- set hv = hostvars[h] %}
+              {%- set r = hv.ps_record | default({}) %}
+              {
+                "name":    {{ h | to_json }},
+                "top_cpu": {{ (r.top_cpu | default([])) | to_json }},
+                "top_mem": {{ (r.top_mem | default([])) | to_json }}
+              }{% if not loop.last %},{% endif %}
+              {%- endfor %}
+            ]
+          }

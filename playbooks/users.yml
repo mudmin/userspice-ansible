@@ -1,0 +1,132 @@
+---
+# users.yml — login users + authorized_keys audit per host. Read-only.
+# For every account with UID 0 or UID >= 1000 that has a real shell:
+#   - name, uid, shell, home dir, login flag (false if shell is nologin/false)
+#   - parsed authorized_keys (type + comment per key, count)
+# Pairs with the planned ssh_hardening role — verify which hosts have which
+# admin keys before flipping PasswordAuthentication off. Reading other
+# users' authorized_keys requires root, so the play runs with become: true.
+# When `ui_report_path` is set, also emits a structured JSON report for the UI.
+#
+#   ansible-playbook users.yml
+#   ansible-playbook users.yml --limit nonprod
+#   ansible-playbook users.yml -e ui_report_path=/tmp/users.json    # report
+
+- name: Login users + authorized_keys
+  hosts: all
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Enumerate users + parse authorized_keys (python+pwd)
+      ansible.builtin.shell: |
+        python3 <<'PY'
+        import json, os, pwd
+        NOLOGIN_SHELLS = {'/usr/sbin/nologin', '/sbin/nologin', '/bin/false', '/usr/bin/false'}
+        KEY_PREFIXES = ('ssh-', 'ecdsa-', 'sk-')
+        def parse_keys(path):
+            keys = []
+            try:
+                with open(path) as f:
+                    for raw in f:
+                        line = raw.strip()
+                        if not line or line.startswith('#'):
+                            continue
+                        parts = line.split(None)
+                        # Either: <type> <b64> [comment...]
+                        # Or:     <options> <type> <b64> [comment...]
+                        ktype, comment = '', ''
+                        if parts and parts[0].startswith(KEY_PREFIXES):
+                            ktype = parts[0]
+                            comment = ' '.join(parts[2:]) if len(parts) > 2 else ''
+                        elif len(parts) >= 2 and parts[1].startswith(KEY_PREFIXES):
+                            ktype = parts[1]
+                            comment = ' '.join(parts[3:]) if len(parts) > 3 else ''
+                        else:
+                            ktype = 'unknown'
+                        keys.append({'type': ktype, 'comment': comment})
+            except Exception:
+                pass
+            return keys
+        out = []
+        for p in pwd.getpwall():
+            if not (p.pw_uid == 0 or p.pw_uid >= 1000):
+                continue
+            login = p.pw_shell not in NOLOGIN_SHELLS
+            keys_path = os.path.join(p.pw_dir, '.ssh', 'authorized_keys')
+            keys = parse_keys(keys_path) if os.path.isfile(keys_path) else []
+            out.append({
+                'name':      p.pw_name,
+                'uid':       p.pw_uid,
+                'shell':     p.pw_shell,
+                'home':      p.pw_dir,
+                'login':     login,
+                'key_count': len(keys),
+                'key_list':  keys,
+            })
+        out.sort(key=lambda r: (r['uid'] != 0, r['name']))
+        print(json.dumps(out))
+        PY
+      args:
+        executable: /bin/bash
+      register: users_json
+      changed_when: false
+
+    - name: Stash per-host user records
+      ansible.builtin.set_fact:
+        users_records: "{{ (users_json.stdout | from_json) if (users_json.stdout | trim | length) > 0 else [] }}"
+
+    - name: Per-host user summary
+      ansible.builtin.debug:
+        msg: |-
+          === {{ inventory_hostname }} ===
+          {% for u in users_records %}
+          {{ "%-16s" | format(u.name) }}  uid={{ "%-5d" | format(u.uid) }}  keys={{ "%-2d" | format(u.key_count) }}  {{ '(login)' if u.login else '(nologin)' }}  {{ u.shell }}
+          {% for k in u.key_list %}
+              - {{ k.type }}  {{ k.comment }}
+          {% endfor %}
+          {% endfor %}
+
+  post_tasks:
+    - name: Emit structured users report for the UI
+      delegate_to: localhost
+      become: false
+      run_once: true
+      check_mode: false
+      when: ui_report_path is defined
+      ansible.builtin.copy:
+        dest: "{{ ui_report_path }}"
+        mode: "0644"
+        content: |-
+          {
+            "report_type": "users",
+            "generated_at": {{ lookup('pipe', 'date -u +%FT%TZ') | to_json }},
+            "hosts": [
+              {%- for h in ansible_play_hosts_all | sort %}
+              {%- set hv = hostvars[h] %}
+              {
+                "name": {{ h | to_json }},
+                "users": [
+                  {%- for u in (hv.users_records | default([])) %}
+                  {
+                    "name":      {{ u.name      | to_json }},
+                    "uid":       {{ u.uid       | int }},
+                    "shell":     {{ u.shell     | to_json }},
+                    "home":      {{ u.home      | to_json }},
+                    "login":     {{ u.login     | to_json }},
+                    "key_count": {{ u.key_count | int }},
+                    "keys": [
+                      {%- for k in u.key_list %}
+                      {
+                        "type":    {{ k.type    | to_json }},
+                        "comment": {{ k.comment | to_json }}
+                      }{% if not loop.last %},{% endif %}
+                      {%- endfor %}
+                    ]
+                  }{% if not loop.last %},{% endif %}
+                  {%- endfor %}
+                ]
+              }{% if not loop.last %},{% endif %}
+              {%- endfor %}
+            ]
+          }

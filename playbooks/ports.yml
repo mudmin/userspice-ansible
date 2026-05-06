@@ -1,0 +1,115 @@
+---
+# ports.yml — listening TCP/UDP sockets per host. Read-only.
+# For every LISTEN/UNCONN socket on each host: protocol, bound address,
+# port, owning process. Pairs with firewall.yml — anything in this report
+# that isn't covered by a firewall rule is either an inadvertent exposure
+# or a missing rule. `ss -p` requires root for non-self processes, so the
+# play runs with become: true.
+# When `ui_report_path` is set, also emits a structured JSON report for the UI.
+#
+#   ansible-playbook ports.yml
+#   ansible-playbook ports.yml --limit omt_servers
+#   ansible-playbook ports.yml -e ui_report_path=/tmp/ports.json    # report
+
+- name: Listening sockets
+  hosts: all
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Capture ss -tnlpH and -unlpH as JSON
+      # Two ss invocations (TCP, UDP), parsed in python so the regex stays
+      # readable. -H suppresses header, -n forces numeric, -l listening
+      # only, -p emits owning process, -t/-u selects family. We only keep
+      # the first process name when ss reports multiple workers.
+      ansible.builtin.shell: |
+        python3 <<'PY'
+        import json, re, subprocess
+        def listeners(family_flag, label):
+            try:
+                out = subprocess.check_output(
+                    ['ss', '-Hnlp', family_flag],
+                    stderr=subprocess.DEVNULL,
+                ).decode()
+            except Exception:
+                return []
+            rows = []
+            for line in out.splitlines():
+                if not line.strip():
+                    continue
+                cols = line.split(None, 5)
+                if len(cols) < 5:
+                    continue
+                local = cols[3]
+                m = re.match(r'^(.*):(\d+)$', local)
+                if not m:
+                    continue
+                addr, port = m.group(1), int(m.group(2))
+                users = cols[5] if len(cols) > 5 else ''
+                names = re.findall(r'\("([^"]+)"', users)
+                proc = names[0] if names else ''
+                rows.append({
+                    'proto':   label,
+                    'address': addr,
+                    'port':    port,
+                    'process': proc,
+                })
+            return rows
+        out = listeners('-t', 'tcp') + listeners('-u', 'udp')
+        out.sort(key=lambda r: (r['proto'], r['port'], r['address']))
+        print(json.dumps(out))
+        PY
+      args:
+        executable: /bin/bash
+      register: ports_json
+      changed_when: false
+
+    - name: Stash per-host listener records
+      ansible.builtin.set_fact:
+        ports_records: "{{ (ports_json.stdout | from_json) if (ports_json.stdout | trim | length) > 0 else [] }}"
+
+    - name: Per-host listener summary
+      ansible.builtin.debug:
+        msg: |-
+          === {{ inventory_hostname }} ===
+          {% if ports_records | length == 0 %}
+          (no listening sockets — unexpected; check ss output manually)
+          {% else %}
+          {% for r in ports_records %}
+          {{ "%-3s" | format(r.proto) }}  {{ "%-22s" | format(r.address ~ ':' ~ r.port) }}  {{ r.process }}
+          {% endfor %}
+          {% endif %}
+
+  post_tasks:
+    - name: Emit structured ports report for the UI
+      delegate_to: localhost
+      become: false
+      run_once: true
+      check_mode: false
+      when: ui_report_path is defined
+      ansible.builtin.copy:
+        dest: "{{ ui_report_path }}"
+        mode: "0644"
+        content: |-
+          {
+            "report_type": "ports",
+            "generated_at": {{ lookup('pipe', 'date -u +%FT%TZ') | to_json }},
+            "hosts": [
+              {%- for h in ansible_play_hosts_all | sort %}
+              {%- set hv = hostvars[h] %}
+              {
+                "name": {{ h | to_json }},
+                "listeners": [
+                  {%- for r in (hv.ports_records | default([])) %}
+                  {
+                    "proto":   {{ r.proto   | to_json }},
+                    "address": {{ r.address | to_json }},
+                    "port":    {{ r.port    | int }},
+                    "process": {{ r.process | to_json }}
+                  }{% if not loop.last %},{% endif %}
+                  {%- endfor %}
+                ]
+              }{% if not loop.last %},{% endif %}
+              {%- endfor %}
+            ]
+          }

@@ -1,0 +1,92 @@
+---
+# webstack.yml — Apache + PHP + /var/www inventory per host. Read-only.
+#
+# Drift-discovery for the apache fleet: every host in this group was
+# built by a slightly-different script and we have no central record
+# of who's running what. This playbook gathers, in one pass:
+#   - Apache server version, MPM module, modules-of-interest, mod_php
+#   - Vhosts (apache2ctl -S) with per-vhost DocumentRoot + the resolved
+#     PHP handler (mod_php / php-fpm version / none) + SSL cert lineage
+#   - PHP: installed major.minor versions, the CLI default (`php -v`),
+#     fpm pools per version
+#   - Node: `node -v` if installed
+#   - /var/www top-level dirs with owner/size/mtime + matched vhost
+#
+# Implementation: gathering is in scripts/webstack.py (real file, not a
+# YAML heredoc) shipped to the target via ansible.builtin.script. The
+# script writes a single JSON document to stdout which we parse.
+#
+# When `ui_report_path` is set, also emits a structured JSON report.
+#
+#   ansible-playbook webstack.yml --limit deploy-spice
+#   ansible-playbook webstack.yml --limit managed_vps
+#   ansible-playbook webstack.yml -e ui_report_path=/tmp/webstack.json
+
+- name: Apache stack inventory
+  hosts: apache
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Run scripts/webstack.py on each host
+      ansible.builtin.script: scripts/webstack.py
+      args:
+        executable: python3
+      register: webstack_json
+      changed_when: false
+
+    - name: Stash per-host webstack record
+      ansible.builtin.set_fact:
+        webstack_record: "{{ webstack_json.stdout | from_json }}"
+
+    - name: Per-host webstack summary
+      ansible.builtin.debug:
+        msg: |-
+          === {{ inventory_hostname }} ===
+          Apache:  {{ webstack_record.apache.version or '(not installed)' }}  mpm={{ webstack_record.apache.mpm or '?' }}{% if webstack_record.apache.mod_php_version %}  mod_php={{ webstack_record.apache.mod_php_version }}{% endif %}{% if webstack_record.apache.modsecurity %}  modsec=on{% endif %}
+          PHP CLI: {{ webstack_record.php.default_cli_full or '(not installed)' }}  (versions installed: {{ webstack_record.php.installed_versions | join(', ') or 'none' }})
+          Node:    {{ webstack_record.node.version or '(not installed)' }}
+          {% if webstack_record.vhosts | length > 0 %}
+          Vhosts ({{ webstack_record.vhosts | length }}):
+          {% for v in webstack_record.vhosts | sort(attribute='server_name') %}
+          {{ "%-3d" | format(v.port) }} {{ "%-40s" | format(v.server_name) }}  doc={{ v.document_root or '?' }}  php={{ v.php_version or '-' }} ({{ v.php_handler or 'none' }}){% if v.ssl_cert_lineage %}  ssl={{ v.ssl_cert_lineage }}{% endif %}
+          {% endfor %}
+          {% else %}
+          Vhosts: none configured
+          {% endif %}
+          {% if webstack_record.webroot | length > 0 %}
+          /var/www ({{ webstack_record.webroot | length }} entries):
+          {% for w in webstack_record.webroot %}
+          {{ "%-30s" | format(w.name) }}  {{ "%-20s" | format(w.owner ~ ':' ~ w.group) }}  {{ "%6.1f" | format(w.size_bytes / 1073741824) }} GB  {{ ('vhost: ' ~ (w.matched_vhosts | join(', '))) if w.matched_vhosts | length > 0 else '(no vhost match)' }}
+          {% endfor %}
+          {% endif %}
+
+  post_tasks:
+    - name: Emit structured webstack report for the UI
+      delegate_to: localhost
+      become: false
+      run_once: true
+      check_mode: false
+      when: ui_report_path is defined
+      ansible.builtin.copy:
+        dest: "{{ ui_report_path }}"
+        mode: "0644"
+        content: |-
+          {
+            "report_type": "webstack",
+            "generated_at": {{ lookup('pipe', 'date -u +%FT%TZ') | to_json }},
+            "hosts": [
+              {%- for h in ansible_play_hosts_all | sort %}
+              {%- set hv = hostvars[h] %}
+              {%- set r = hv.webstack_record | default({}) %}
+              {
+                "name":   {{ h | to_json }},
+                "apache": {{ r.apache  | default({}) | to_json }},
+                "vhosts": {{ r.vhosts  | default([]) | to_json }},
+                "php":    {{ r.php     | default({}) | to_json }},
+                "node":   {{ r.node    | default({}) | to_json }},
+                "webroot":{{ r.webroot | default([]) | to_json }}
+              }{% if not loop.last %},{% endif %}
+              {%- endfor %}
+            ]
+          }

@@ -1,0 +1,14 @@
+# Variables applied to every host (group "all" is implicit and universal).
+# ----------------------------------------------------------------------------
+# Override per-group in group_vars/<group>.yml or per-host in host_vars/<host>.yml.
+# To use this file, rename it to all.yml.
+# ----------------------------------------------------------------------------
+
+# Default SSH user — override per-group or per-host as needed.
+ansible_user: ubuntu
+
+# Default SSH private key.
+ansible_ssh_private_key_file: ~/.ssh/id_ed25519
+
+# Common timezone (referenced by baseline-style playbooks).
+# system_timezone: America/New_York

@@ -1,0 +1,92 @@
+---
+# tail.yml — last N lines of a whitelisted log file per host. Read-only.
+#
+# UI_PARAMS:
+#   log:   enum(apache_error|apache_access|mariadb_error|syslog|journalctl) required
+#   lines: int default=200 min=1 max=10000
+#
+# `log` is a key, not a path — the script resolves it (apache_error →
+# /var/log/apache2/error.log, journalctl → systemd journal). Hosts where
+# the log doesn't exist return exists:false with empty lines rather than
+# failing, so a fleet-wide tail of e.g. `apache_error` skips non-Apache
+# hosts gracefully.
+#
+# When `ui_report_path` is set, also emits a structured JSON report.
+#
+#   ansible-playbook tail.yml --limit deploy-spice -e log=apache_error -e lines=100
+#   ansible-playbook tail.yml --limit nonprod      -e log=syslog
+#   ansible-playbook tail.yml --limit apache       -e log=journalctl -e ui_report_path=/tmp/tail.json
+
+- name: Tail a log
+  hosts: all
+  become: true
+  gather_facts: false
+
+  tasks:
+    # Defense in depth — the UI also validates these, but a CLI run that
+    # bypasses the UI should still be rejected if it tries to read an
+    # arbitrary path or an unbounded line count.
+    - name: Validate parameters
+      ansible.builtin.assert:
+        that:
+          - log is defined
+          - log in ['apache_error', 'apache_access', 'mariadb_error', 'syslog', 'journalctl']
+          - (lines | default(200)) | int >= 1
+          - (lines | default(200)) | int <= 10000
+        fail_msg: "Invalid parameters: log must be one of the whitelist; lines must be 1..10000"
+        quiet: true
+      run_once: true
+      delegate_to: localhost
+      become: false
+
+    - name: Read the log via scripts/tail.py
+      ansible.builtin.script: "scripts/tail.py {{ log }} {{ (lines | default(200)) | int }}"
+      args:
+        executable: python3
+      register: tail_json
+      changed_when: false
+
+    - name: Stash per-host tail record
+      ansible.builtin.set_fact:
+        tail_record: "{{ tail_json.stdout | from_json }}"
+
+    - name: Per-host tail summary
+      ansible.builtin.debug:
+        msg: |-
+          === {{ inventory_hostname }} ===
+          {{ tail_record.path }}: {{ tail_record.n_returned }} of {{ tail_record.n_requested }} lines{% if not tail_record.exists %}  (file/journal not present){% endif %}
+
+  post_tasks:
+    - name: Emit structured tail report for the UI
+      delegate_to: localhost
+      become: false
+      run_once: true
+      check_mode: false
+      when: ui_report_path is defined
+      ansible.builtin.copy:
+        dest: "{{ ui_report_path }}"
+        mode: "0644"
+        content: |-
+          {
+            "report_type": "tail",
+            "generated_at": {{ lookup('pipe', 'date -u +%FT%TZ') | to_json }},
+            "params": {
+              "log":   {{ log | to_json }},
+              "lines": {{ (lines | default(200)) | int }}
+            },
+            "hosts": [
+              {%- for h in ansible_play_hosts_all | sort %}
+              {%- set hv = hostvars[h] %}
+              {%- set r = hv.tail_record | default({}) %}
+              {
+                "name":        {{ h | to_json }},
+                "log_key":     {{ (r.log_key     | default('')) | to_json }},
+                "path":        {{ (r.path        | default('')) | to_json }},
+                "exists":      {{ (r.exists      | default(false)) | to_json }},
+                "n_returned":  {{ (r.n_returned  | default(0))  | int }},
+                "n_requested": {{ (r.n_requested | default(0))  | int }},
+                "lines":       {{ (r.lines       | default([])) | to_json }}
+              }{% if not loop.last %},{% endif %}
+              {%- endfor %}
+            ]
+          }

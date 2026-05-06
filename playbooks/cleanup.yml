@@ -1,0 +1,113 @@
+---
+# cleanup.yml — disk hygiene per host. apt autoremove + autoclean,
+# journalctl vacuum, /tmp prune. Mutating only when apply=true.
+#
+# UI_PARAMS:
+#   apply:     bool default=false
+#   keep_days: int  default=14 min=1 max=365
+#
+# apply=false (default) is preview-only:
+#   - apt: simulates autoremove + autoclean, reports packages and the
+#     estimated bytes that would be freed
+#   - journal: reports current journalctl --disk-usage
+#   - /tmp:   lists files older than keep_days as candidates
+#
+# apply=true executes the same operations:
+#   - apt autoremove + autoclean (with DEBIAN_FRONTEND=noninteractive)
+#   - journalctl --vacuum-time=<keep_days>d
+#   - unlinks the listed /tmp files
+#
+# /tmp prune is intentionally conservative — top-level regular files
+# only (no subdirs / sockets / FIFOs / symlinks), and BOTH atime and
+# mtime must exceed keep_days. Real app data tends to live in
+# subdirectories or has its access time updated; this rule deletes only
+# stale debris.
+#
+# Defense in depth: the playbook validates apply + keep_days; the script
+# re-validates keep_days bounds. If the script writes {"error": "..."}
+# the task surfaces it via the debug summary.
+#
+# When `ui_report_path` is set, also emits a structured JSON report.
+#
+#   ansible-playbook cleanup.yml --limit deploy-spice                       # preview
+#   ansible-playbook cleanup.yml --limit deploy-spice -e apply=true         # execute
+#   ansible-playbook cleanup.yml --limit nonprod -e apply=true -e keep_days=7
+
+- name: Disk cleanup
+  hosts: all
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Validate parameters
+      ansible.builtin.assert:
+        that:
+          - (apply | default(false) | string) in ['True', 'False', 'true', 'false']
+          - (keep_days | default(14)) | int >= 1
+          - (keep_days | default(14)) | int <= 365
+        fail_msg: "apply must be true|false; keep_days must be 1..365"
+        quiet: true
+      run_once: true
+      delegate_to: localhost
+      become: false
+
+    - name: Run scripts/cleanup.py
+      ansible.builtin.script: "scripts/cleanup.py {{ apply | default(false) | bool | string | lower }} {{ (keep_days | default(14)) | int }}"
+      args:
+        executable: python3
+      register: cleanup_json
+      changed_when: (apply | default(false)) | bool
+
+    - name: Stash per-host cleanup record
+      ansible.builtin.set_fact:
+        cleanup_record: "{{ cleanup_json.stdout | from_json }}"
+
+    - name: Per-host cleanup summary
+      vars:
+        # Inline conditionals here keep us out of the {% if %} trap —
+        # ansible's Jinja has trim_blocks=True, which silently eats the
+        # newline after a `{% endif %}` and smushes the next line into it.
+        journal_after_suffix: "{{ ' → ' ~ ((cleanup_record.journal.after_kb | default(0)) / 1024) | round(1) ~ ' MB (freed ' ~ ((cleanup_record.journal.freed_kb | default(0)) / 1024) | round(1) ~ ' MB)' if cleanup_record.apply else '' }}"
+        tmp_after_suffix:     "{{ ' → removed ' ~ (cleanup_record.tmp.removed_count | default(0)) ~ ' files, ' ~ ((cleanup_record.tmp.removed_bytes | default(0)) / 1048576) | round(1) ~ ' MB' if cleanup_record.apply else '' }}"
+      ansible.builtin.debug:
+        msg: |-
+          === {{ inventory_hostname }} ===
+          Mode: {{ 'APPLY' if cleanup_record.apply else 'preview' }}  (keep_days={{ cleanup_record.keep_days }})
+          apt autoremove: {{ cleanup_record.apt.autoremove_packages | length }} packages, ~{{ ((cleanup_record.apt.autoremove_freed_kb_estimate | default(0)) / 1024) | round(1) }} MB
+          apt autoclean:  ~{{ ((cleanup_record.apt.autoclean_freed_kb_estimate | default(0)) / 1024) | round(1) }} MB
+          journal:        {{ ((cleanup_record.journal.before_kb | default(0)) / 1024) | round(1) }} MB on disk{{ journal_after_suffix }}
+          /tmp prune:     {{ cleanup_record.tmp.candidate_count }} files, {{ ((cleanup_record.tmp.candidate_bytes | default(0)) / 1048576) | round(1) }} MB{{ tmp_after_suffix }}
+
+  post_tasks:
+    - name: Emit structured cleanup report for the UI
+      delegate_to: localhost
+      become: false
+      run_once: true
+      check_mode: false
+      when: ui_report_path is defined
+      ansible.builtin.copy:
+        dest: "{{ ui_report_path }}"
+        mode: "0644"
+        content: |-
+          {
+            "report_type": "cleanup",
+            "generated_at": {{ lookup('pipe', 'date -u +%FT%TZ') | to_json }},
+            "params": {
+              "apply":     {{ (apply | default(false) | bool) | to_json }},
+              "keep_days": {{ (keep_days | default(14)) | int }}
+            },
+            "hosts": [
+              {%- for h in ansible_play_hosts_all | sort %}
+              {%- set hv = hostvars[h] %}
+              {%- set r = hv.cleanup_record | default({}) %}
+              {
+                "name":      {{ h | to_json }},
+                "applied":   {{ (r.apply | default(false)) | to_json }},
+                "keep_days": {{ (r.keep_days | default(14)) | int }},
+                "apt":       {{ (r.apt     | default({})) | to_json }},
+                "journal":   {{ (r.journal | default({})) | to_json }},
+                "tmp":       {{ (r.tmp     | default({})) | to_json }}
+              }{% if not loop.last %},{% endif %}
+              {%- endfor %}
+            ]
+          }

@@ -1,0 +1,129 @@
+---
+# service.yml — restart, reload, or query the status of a whitelisted
+# systemd unit per host. Mutating for restart/reload; read-only for status.
+#
+# UI_PARAMS:
+#   service: enum(apache2|fail2ban|mariadb|mysql|nginx|php8.1-fpm|php8.2-fpm|php8.3-fpm|php8.4-fpm|ssh|sshd|tailscaled|ufw) required extra_var=ui_safe_services_extra
+#   action:  enum(restart|reload|status) required default=status
+#
+# Whitelist composition. The default service list above is hardcoded —
+# kept tight on purpose. To allow additional units on specific hosts or
+# groups without editing this file, declare a list in their group_vars
+# (or host_vars) under the same name the UI_PARAMS line references:
+#
+#   # group_vars/omt_cms.yml
+#   ui_safe_services_extra:
+#     - redis-server
+#     - syncthing@cms
+#
+# At runtime the playbook validates `service` against the union of the
+# default list and the host's composed `ui_safe_services_extra`. The UI
+# does the same when rendering the dropdown for that target — the
+# extras only appear once a target is picked, since they're per-group.
+#
+# Defense in depth: the assert below catches any value not in the
+# composed whitelist, even on a CLI bypass that didn't go through the
+# UI's validation.
+#
+# When `ui_report_path` is set, also emits a structured JSON report
+# capturing the unit's before/after state.
+#
+#   ansible-playbook service.yml --limit deploy-spice -e service=apache2 -e action=status
+#   ansible-playbook service.yml --limit omt-cms     -e service=mariadb -e action=restart
+
+- name: Service action
+  hosts: all
+  become: true
+  gather_facts: false
+
+  vars:
+    default_services:
+      - apache2
+      - fail2ban
+      - mariadb
+      - mysql
+      - nginx
+      - php8.1-fpm
+      - php8.2-fpm
+      - php8.3-fpm
+      - php8.4-fpm
+      - ssh
+      - sshd
+      - tailscaled
+      - ufw
+    effective_services: "{{ default_services + (ui_safe_services_extra | default([])) }}"
+
+  tasks:
+    - name: Validate parameters
+      ansible.builtin.assert:
+        that:
+          - service is defined
+          - service in effective_services
+          - action is defined
+          - action in ['restart', 'reload', 'status']
+        fail_msg: "service must be in the composed whitelist (default + ui_safe_services_extra); action must be restart|reload|status"
+        quiet: true
+
+    - name: Run scripts/service.py
+      ansible.builtin.script: "scripts/service.py {{ service | quote }} {{ action }}"
+      args:
+        executable: python3
+      register: svc_json
+      # Mark the task changed only when we actually mutated state.
+      # Status queries are read-only; ansible's default for `script:` is
+      # always-changed which would be misleading in the recap.
+      changed_when: action != 'status'
+      # script: returns rc=1 when systemctl restart/reload itself fails;
+      # we still want the JSON record (with .error set) to be captured
+      # by set_fact below, so don't fail the task here.
+      failed_when: false
+
+    - name: Stash per-host service record
+      ansible.builtin.set_fact:
+        service_record: "{{ svc_json.stdout | from_json }}"
+
+    - name: Per-host service summary
+      ansible.builtin.debug:
+        msg: |-
+          === {{ inventory_hostname }} ===
+          {{ service_record.service }} {{ service_record.action }}: {{ 'FAILED' if service_record.error else 'OK' }}
+          before: ActiveState={{ service_record.before.ActiveState | default('?') }}  SubState={{ service_record.before.SubState | default('?') }}  UnitFileState={{ service_record.before.UnitFileState | default('?') }}
+          {% if service_record.mutated %}
+          after:  ActiveState={{ service_record.after.ActiveState | default('?') }}  SubState={{ service_record.after.SubState | default('?') }}
+          {% endif %}
+          {% if service_record.error %}error:  {{ service_record.error }}{% endif %}
+
+  post_tasks:
+    - name: Emit structured service report for the UI
+      delegate_to: localhost
+      become: false
+      run_once: true
+      check_mode: false
+      when: ui_report_path is defined
+      ansible.builtin.copy:
+        dest: "{{ ui_report_path }}"
+        mode: "0644"
+        content: |-
+          {
+            "report_type": "service",
+            "generated_at": {{ lookup('pipe', 'date -u +%FT%TZ') | to_json }},
+            "params": {
+              "service": {{ service | to_json }},
+              "action":  {{ action | to_json }}
+            },
+            "hosts": [
+              {%- for h in ansible_play_hosts_all | sort %}
+              {%- set hv = hostvars[h] %}
+              {%- set r = hv.service_record | default({}) %}
+              {
+                "name":    {{ h | to_json }},
+                "service": {{ (r.service | default('')) | to_json }},
+                "action":  {{ (r.action  | default('')) | to_json }},
+                "mutated": {{ (r.mutated | default(false)) | to_json }},
+                "error":   {{ (r.error   | default(None)) | to_json }},
+                "before":  {{ (r.before  | default({})) | to_json }},
+                "after":   {{ (r.after   | default({})) | to_json }}
+              }{% if not loop.last %},{% endif %}
+              {%- endfor %}
+            ]
+          }

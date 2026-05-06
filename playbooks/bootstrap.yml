@@ -1,0 +1,37 @@
+---
+# bootstrap.yml — push the control node's SSH public key to a target host that
+# is currently password-authenticated. After this runs successfully, key auth
+# works and add_server.sh strips the password from host_vars/<name>.yml.
+#
+# Driven by add_server.sh; not normally run by hand. To run by hand:
+#   ansible-playbook bootstrap.yml --limit <name>
+# (host_vars/<name>.yml must contain vault-encrypted ansible_password.)
+
+- name: Push SSH public key to new host
+  hosts: all
+  gather_facts: false
+  vars:
+    # Force password-style auth for this bootstrap connection. Without this,
+    # ssh tries every available pubkey first; on a fresh host none of them
+    # match, and sshd's MaxAuthTries (default 6) kicks the connection before
+    # sshpass ever gets to feed the password. The visible symptom is
+    # "Permission denied (publickey,password)" even when the password is
+    # correct. IdentitiesOnly=yes prevents ssh-agent keys from being offered;
+    # NumberOfPasswordPrompts=1 fails fast instead of looping.
+    #
+    # Both `password` and `keyboard-interactive` are listed because some hosts
+    # (notably Ubuntu 22.04 VPS images) only accept keyboard-interactive even
+    # though the user-facing prompt looks identical. Listing both lets the
+    # client fall through to whichever the server actually allows.
+    ansible_ssh_common_args: >-
+      -o PreferredAuthentications=password,keyboard-interactive
+      -o PubkeyAuthentication=no
+      -o IdentitiesOnly=yes
+      -o NumberOfPasswordPrompts=1
+  tasks:
+    - name: Install control node's public key into authorized_keys
+      ansible.posix.authorized_key:
+        user: "{{ ansible_user }}"
+        state: present
+        key: "{{ lookup('file', lookup('env', 'HOME') + '/.ssh/id_ed25519.pub') }}"
+        manage_dir: true

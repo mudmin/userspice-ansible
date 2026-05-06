@@ -1,0 +1,22 @@
+# Per-host variables.
+# ----------------------------------------------------------------------------
+# File name must match a host name in inventory.ini. To use this template,
+# rename it: e.g. host_vars/web1.yml applies to a host named "web1".
+#
+# To encrypt secrets in this file:
+#   ansible-vault encrypt host_vars/web1.yml
+#
+# When you run a playbook that needs decryption, ansible will prompt for the
+# vault password. The web UI cannot supply a vault password — playbooks that
+# need decryption must be run from the CLI.
+# ----------------------------------------------------------------------------
+
+ansible_user: ubuntu
+ansible_ssh_private_key_file: ~/.ssh/id_ed25519
+
+# If sudo on this host requires a password, vault-encrypt this file and set:
+# ansible_become_password: "your-sudo-password-here"
+
+# Per-app variables your playbooks reference:
+# app_port: 8080
+# app_env: production

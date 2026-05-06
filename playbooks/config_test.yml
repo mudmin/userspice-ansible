@@ -1,0 +1,91 @@
+---
+# config_test.yml — preflight config-file syntax check per host. Read-only.
+#
+# UI_PARAMS:
+#   what: enum(apache|nginx|sshd|mariadb) required
+#
+# Wraps each tool's "validate config" command:
+#   apache  → apache2ctl configtest
+#   nginx   → nginx -t
+#   sshd    → sshd -t
+#   mariadb → mariadbd --validate-config
+#
+# Designed to pair with service.yml's reload action — run config_test
+# fleet-wide first, get all-green, *then* reload. Hosts that don't have
+# the tool installed return applicable:false (rather than failing), so
+# `--limit apache -e what=apache` skips any host without apache2ctl
+# without polluting the recap with failures.
+#
+# When `ui_report_path` is set, also emits a structured JSON report.
+#
+#   ansible-playbook config_test.yml --limit deploy-spice -e what=apache
+#   ansible-playbook config_test.yml --limit nonprod      -e what=sshd
+#   ansible-playbook config_test.yml --limit apache       -e what=apache -e ui_report_path=/tmp/ct.json
+
+- name: Config test
+  hosts: all
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Validate parameters
+      ansible.builtin.assert:
+        that:
+          - what is defined
+          - what in ['apache', 'nginx', 'sshd', 'mariadb']
+        fail_msg: "what must be one of apache|nginx|sshd|mariadb"
+        quiet: true
+      run_once: true
+      delegate_to: localhost
+      become: false
+
+    - name: Run scripts/config_test.py
+      ansible.builtin.script: "scripts/config_test.py {{ what }}"
+      args:
+        executable: python3
+      register: config_test_json
+      changed_when: false
+
+    - name: Stash per-host config_test record
+      ansible.builtin.set_fact:
+        config_test_record: "{{ config_test_json.stdout | from_json }}"
+
+    - name: Per-host config_test summary
+      ansible.builtin.debug:
+        msg: |-
+          === {{ inventory_hostname }} ===
+          {{ config_test_record.what }}: {% if not config_test_record.applicable %}(not applicable){% elif config_test_record.ok %}OK{% else %}FAILED (rc={{ config_test_record.exit_code }}){% endif %}
+          {% if config_test_record.output %}{{ config_test_record.output }}{% endif %}
+
+  post_tasks:
+    - name: Emit structured config_test report for the UI
+      delegate_to: localhost
+      become: false
+      run_once: true
+      check_mode: false
+      when: ui_report_path is defined
+      ansible.builtin.copy:
+        dest: "{{ ui_report_path }}"
+        mode: "0644"
+        content: |-
+          {
+            "report_type": "config_test",
+            "generated_at": {{ lookup('pipe', 'date -u +%FT%TZ') | to_json }},
+            "params": {
+              "what": {{ what | to_json }}
+            },
+            "hosts": [
+              {%- for h in ansible_play_hosts_all | sort %}
+              {%- set hv = hostvars[h] %}
+              {%- set r = hv.config_test_record | default({}) %}
+              {
+                "name":       {{ h | to_json }},
+                "what":       {{ (r.what       | default('')) | to_json }},
+                "applicable": {{ (r.applicable | default(false)) | to_json }},
+                "ok":         {{ (r.ok         | default(None)) | to_json }},
+                "output":     {{ (r.output     | default('')) | to_json }},
+                "exit_code":  {{ (r.exit_code  | default(None)) | to_json }}
+              }{% if not loop.last %},{% endif %}
+              {%- endfor %}
+            ]
+          }

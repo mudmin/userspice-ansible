@@ -1,0 +1,130 @@
+---
+# certs.yml — TLS certificate inventory + expiry for the fleet. Read-only.
+# Reads every /etc/letsencrypt/live/<lineage>/cert.pem on each Apache host:
+# subject, issuer, notBefore, notAfter, SAN list, days remaining.
+# Status: ok (>=30d), warn (<30d), critical (<7d), expired (<0d).
+# When `ui_report_path` is set, also emits a structured JSON report for the UI.
+#
+#   ansible-playbook certs.yml
+#   ansible-playbook certs.yml --limit managed_vps
+#   ansible-playbook certs.yml -e ui_report_path=/tmp/certs.json    # report
+
+- name: TLS certificate inventory
+  hosts: apache
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Read /etc/letsencrypt/live/*/cert.pem (python+openssl)
+      # Single round-trip: python iterates lineages, shells out to openssl
+      # for each cert, computes days_left, emits one JSON document. Shell
+      # parsing of openssl output is fiddly (multi-line SANs, quoting in
+      # subjects); JSON via python is the safe path.
+      ansible.builtin.shell: |
+        python3 <<'PY'
+        import glob, json, os, subprocess, time
+        def x509(path, *args):
+            try:
+                return subprocess.check_output(
+                    ['openssl', 'x509', '-in', path, '-noout', *args],
+                    stderr=subprocess.DEVNULL,
+                ).decode().strip()
+            except Exception:
+                return ''
+        def strip_prefix(s, p):
+            return s[len(p):].strip() if s.startswith(p) else s.strip()
+        out = []
+        for path in sorted(glob.glob('/etc/letsencrypt/live/*/cert.pem')):
+            lineage = os.path.basename(os.path.dirname(path))
+            subject = strip_prefix(x509(path, '-subject'),   'subject=')
+            issuer  = strip_prefix(x509(path, '-issuer'),    'issuer=')
+            start   = strip_prefix(x509(path, '-startdate'), 'notBefore=')
+            end     = strip_prefix(x509(path, '-enddate'),   'notAfter=')
+            try:
+                end_epoch = int(subprocess.check_output(
+                    ['date', '-d', end, '+%s'],
+                    stderr=subprocess.DEVNULL,
+                ).decode().strip())
+            except Exception:
+                end_epoch = 0
+            days_left = (end_epoch - int(time.time())) // 86400 if end_epoch else -1
+            sans = []
+            for line in x509(path, '-ext', 'subjectAltName').splitlines():
+                for tok in line.split(','):
+                    tok = tok.strip()
+                    if tok.startswith('DNS:'):
+                        sans.append(tok[4:])
+            if   days_left < 0:  status = 'expired'
+            elif days_left < 7:  status = 'critical'
+            elif days_left < 30: status = 'warn'
+            else:                status = 'ok'
+            out.append({
+                'lineage':    lineage,
+                'subject':    subject,
+                'issuer':     issuer,
+                'not_before': start,
+                'not_after':  end,
+                'sans':       sans,
+                'days_left':  int(days_left),
+                'status':     status,
+            })
+        print(json.dumps(out))
+        PY
+      args:
+        executable: /bin/bash
+      register: cert_json
+      changed_when: false
+
+    - name: Stash per-host cert records
+      ansible.builtin.set_fact:
+        certs_records: "{{ (cert_json.stdout | from_json) if (cert_json.stdout | trim | length) > 0 else [] }}"
+
+    - name: Per-host cert summary
+      ansible.builtin.debug:
+        msg: |-
+          === {{ inventory_hostname }} ===
+          {% if certs_records | length == 0 %}
+          (no /etc/letsencrypt/live certs found)
+          {% else %}
+          {% for c in certs_records | sort(attribute='days_left') %}
+          {{ "%-8s" | format(c.status | upper) }}  {{ "%5d" | format(c.days_left) }}d  {{ c.lineage }}  (expires {{ c.not_after }})
+          {% endfor %}
+          {% endif %}
+
+  post_tasks:
+    - name: Emit structured certs report for the UI
+      delegate_to: localhost
+      become: false
+      run_once: true
+      check_mode: false
+      when: ui_report_path is defined
+      ansible.builtin.copy:
+        dest: "{{ ui_report_path }}"
+        mode: "0644"
+        content: |-
+          {
+            "report_type": "certs",
+            "generated_at": {{ lookup('pipe', 'date -u +%FT%TZ') | to_json }},
+            "hosts": [
+              {%- for h in ansible_play_hosts_all | sort %}
+              {%- set hv = hostvars[h] %}
+              {
+                "name": {{ h | to_json }},
+                "certs": [
+                  {%- for c in (hv.certs_records | default([])) %}
+                  {
+                    "lineage":    {{ c.lineage    | to_json }},
+                    "subject":    {{ c.subject    | to_json }},
+                    "issuer":     {{ c.issuer     | to_json }},
+                    "not_before": {{ c.not_before | to_json }},
+                    "not_after":  {{ c.not_after  | to_json }},
+                    "sans":       {{ c.sans       | to_json }},
+                    "days_left":  {{ c.days_left  | int }},
+                    "status":     {{ c.status     | to_json }}
+                  }{% if not loop.last %},{% endif %}
+                  {%- endfor %}
+                ]
+              }{% if not loop.last %},{% endif %}
+              {%- endfor %}
+            ]
+          }

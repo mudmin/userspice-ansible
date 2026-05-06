@@ -1,0 +1,90 @@
+---
+# db.yml — MariaDB / MySQL inventory per host. Read-only.
+#
+# For each host, detects whether mariadb-server or mysql-server (or
+# neither) is installed, the package version, the running server version
+# via `SELECT VERSION()`, service state, datadir size, and a couple of
+# tunables that drift catastrophically if untouched (max_connections,
+# innodb_buffer_pool_size).
+#
+# Auth strategy — try in order, fail gracefully on each:
+#   1. `mariadb -BNe "SELECT VERSION()"` — Ubuntu MariaDB ships with
+#      unix-socket auth for root@localhost; works as root with no creds.
+#   2. `mysql --defaults-file=/etc/mysql/debian.cnf -BNe ...` — package
+#      debian-sys-maint creds, root-readable.
+#   3. Just `mariadb -V` / `mysql -V` for the binary banner.
+# If none work, running_version stays null and binary_version is best-effort.
+#
+# Implementation: gathering is in scripts/db.py (real file, not a YAML
+# heredoc) shipped to the target via ansible.builtin.script.
+#
+# When `ui_report_path` is set, also emits a structured JSON report.
+#
+#   ansible-playbook db.yml --limit deploy-spice
+#   ansible-playbook db.yml --limit apache
+#   ansible-playbook db.yml -e ui_report_path=/tmp/db.json
+
+- name: Database inventory
+  hosts: all
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Run scripts/db.py on each host
+      ansible.builtin.script: scripts/db.py
+      args:
+        executable: python3
+      register: db_json
+      changed_when: false
+
+    - name: Stash per-host db record
+      ansible.builtin.set_fact:
+        db_record: "{{ db_json.stdout | from_json }}"
+
+    - name: Per-host db summary
+      ansible.builtin.debug:
+        msg: |-
+          === {{ inventory_hostname }} ===
+          {% if db_record.flavor == 'none' %}
+          (no DB server installed)
+          {% else %}
+          Flavor:   {{ db_record.flavor }}
+          Package:  {{ db_record.package_version }}
+          Running:  {{ db_record.running_version or '(query failed — auth or service down)' }}
+          Service:  {{ db_record.service_state or 'unknown' }}
+          Datadir:  {{ db_record.datadir_path }}  ({{ db_record.datadir_size_gb if db_record.datadir_size_gb is not none else '?' }} GB)
+          Tunables: max_connections={{ db_record.tunables.max_connections or '?' }}  innodb_buffer_pool_size={{ db_record.tunables.innodb_buffer_pool_size or '?' }}
+          {% endif %}
+
+  post_tasks:
+    - name: Emit structured db report for the UI
+      delegate_to: localhost
+      become: false
+      run_once: true
+      check_mode: false
+      when: ui_report_path is defined
+      ansible.builtin.copy:
+        dest: "{{ ui_report_path }}"
+        mode: "0644"
+        content: |-
+          {
+            "report_type": "db",
+            "generated_at": {{ lookup('pipe', 'date -u +%FT%TZ') | to_json }},
+            "hosts": [
+              {%- for h in ansible_play_hosts_all | sort %}
+              {%- set hv = hostvars[h] %}
+              {%- set r = hv.db_record | default({}) %}
+              {
+                "name":            {{ h | to_json }},
+                "flavor":          {{ (r.flavor          | default('none')) | to_json }},
+                "package_version": {{ r.package_version  | default(None) | to_json }},
+                "binary_version":  {{ r.binary_version   | default(None) | to_json }},
+                "running_version": {{ r.running_version  | default(None) | to_json }},
+                "service_state":   {{ r.service_state    | default(None) | to_json }},
+                "datadir_path":    {{ r.datadir_path     | default(None) | to_json }},
+                "datadir_size_gb": {{ r.datadir_size_gb  | default(None) | to_json }},
+                "tunables":        {{ r.tunables         | default({}) | to_json }}
+              }{% if not loop.last %},{% endif %}
+              {%- endfor %}
+            ]
+          }

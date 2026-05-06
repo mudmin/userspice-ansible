@@ -1,0 +1,105 @@
+---
+# unit_log.yml — last N lines of `journalctl -u <unit>` for a whitelisted
+# systemd unit, per host. Read-only.
+#
+# UI_PARAMS:
+#   unit:  enum(apache2|fail2ban|mariadb|mysql|nginx|php8.1-fpm|php8.2-fpm|php8.3-fpm|php8.4-fpm|ssh|sshd|tailscaled|ufw) required extra_var=ui_safe_services_extra
+#   lines: int default=200 min=1 max=10000
+#
+# Same whitelist + extra_var as service.yml so a unit that's allowed
+# for restart/reload is also viewable here without separate config.
+# Add per-group services in group_vars/<g>.yml: ui_safe_services_extra.
+#
+# Hosts where the unit isn't loaded return exists:false with empty lines
+# rather than failing — fleet-wide pulls (e.g. mariadb logs across all
+# apache hosts) skip non-applicable hosts gracefully.
+#
+# When `ui_report_path` is set, also emits a structured JSON report.
+#
+#   ansible-playbook unit_log.yml --limit deploy-spice -e unit=apache2 -e lines=100
+#   ansible-playbook unit_log.yml --limit omt-cms     -e unit=mariadb
+#   ansible-playbook unit_log.yml --limit nonprod     -e unit=ssh -e lines=50
+
+- name: Unit log
+  hosts: all
+  become: true
+  gather_facts: false
+
+  vars:
+    default_units:
+      - apache2
+      - fail2ban
+      - mariadb
+      - mysql
+      - nginx
+      - php8.1-fpm
+      - php8.2-fpm
+      - php8.3-fpm
+      - php8.4-fpm
+      - ssh
+      - sshd
+      - tailscaled
+      - ufw
+    effective_units: "{{ default_units + (ui_safe_services_extra | default([])) }}"
+
+  tasks:
+    - name: Validate parameters
+      ansible.builtin.assert:
+        that:
+          - unit is defined
+          - unit in effective_units
+          - (lines | default(200)) | int >= 1
+          - (lines | default(200)) | int <= 10000
+        fail_msg: "unit must be in the composed whitelist (default + ui_safe_services_extra); lines must be 1..10000"
+        quiet: true
+
+    - name: Read journal via scripts/unit_log.py
+      ansible.builtin.script: "scripts/unit_log.py {{ unit | quote }} {{ (lines | default(200)) | int }}"
+      args:
+        executable: python3
+      register: unit_log_json
+      changed_when: false
+
+    - name: Stash per-host unit log record
+      ansible.builtin.set_fact:
+        unit_log_record: "{{ unit_log_json.stdout | from_json }}"
+
+    - name: Per-host unit log summary
+      ansible.builtin.debug:
+        msg: |-
+          === {{ inventory_hostname }} ===
+          {{ unit_log_record.unit }}: {{ unit_log_record.n_returned }} of {{ unit_log_record.n_requested }} lines{% if not unit_log_record.exists %}  (unit not loaded){% endif %}
+
+  post_tasks:
+    - name: Emit structured unit_log report for the UI
+      delegate_to: localhost
+      become: false
+      run_once: true
+      check_mode: false
+      when: ui_report_path is defined
+      ansible.builtin.copy:
+        dest: "{{ ui_report_path }}"
+        mode: "0644"
+        content: |-
+          {
+            "report_type": "unit_log",
+            "generated_at": {{ lookup('pipe', 'date -u +%FT%TZ') | to_json }},
+            "params": {
+              "unit":  {{ unit | to_json }},
+              "lines": {{ (lines | default(200)) | int }}
+            },
+            "hosts": [
+              {%- for h in ansible_play_hosts_all | sort %}
+              {%- set hv = hostvars[h] %}
+              {%- set r = hv.unit_log_record | default({}) %}
+              {
+                "name":        {{ h | to_json }},
+                "unit":        {{ (r.unit        | default('')) | to_json }},
+                "exists":      {{ (r.exists      | default(false)) | to_json }},
+                "n_returned":  {{ (r.n_returned  | default(0)) | int }},
+                "n_requested": {{ (r.n_requested | default(0)) | int }},
+                "lines":       {{ (r.lines       | default([])) | to_json }}
+              }{% if not loop.last %},{% endif %}
+              {%- endfor %}
+            ]
+          }

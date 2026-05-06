@@ -1,0 +1,125 @@
+---
+# fleet_health.yml — read-only health check across the fleet.
+# Gathers: disk, memory, swap, uptime, reboot-required, failed systemd units,
+# running vs latest installed kernel, last unattended-upgrade activity.
+# Renders a markdown report to reports/<YYYY-MM-DD>.md on the control node.
+#
+#   ansible-playbook fleet_health.yml
+#   ansible-playbook fleet_health.yml --limit nonprod
+
+- name: Fleet health
+  hosts: all
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: Check /var/run/reboot-required
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_flag
+
+    - name: List failed systemd units
+      ansible.builtin.command: systemctl list-units --state=failed --no-legend --plain
+      register: failed_units
+      changed_when: false
+
+    - name: Find latest installed kernel
+      ansible.builtin.shell: |
+        dpkg-query -W -f='${Package}\n' 'linux-image-*' 2>/dev/null \
+          | grep -E '^linux-image-[0-9]' \
+          | sed 's/^linux-image-//' \
+          | sort -V \
+          | tail -1
+      args:
+        executable: /bin/bash
+      register: latest_kernel
+      changed_when: false
+
+    - name: Stat unattended-upgrades log
+      ansible.builtin.stat:
+        path: /var/log/unattended-upgrades/unattended-upgrades.log
+      register: unattended_log
+
+    - name: Get pretty uptime
+      ansible.builtin.command: uptime -p
+      register: uptime_pretty
+      changed_when: false
+
+    - name: Ensure reports directory exists on control node
+      ansible.builtin.file:
+        path: "{{ playbook_dir }}/reports"
+        state: directory
+        mode: '0755'
+      delegate_to: localhost
+      become: false
+      run_once: true
+
+    - name: Render markdown report
+      ansible.builtin.template:
+        src: templates/fleet_health.md.j2
+        dest: "{{ playbook_dir }}/reports/{{ '%Y-%m-%d' | strftime(ansible_facts.date_time.epoch | int) }}.md"
+        mode: '0644'
+      delegate_to: localhost
+      become: false
+      run_once: true
+
+    - name: Show report path
+      ansible.builtin.debug:
+        msg: "Report written to reports/{{ '%Y-%m-%d' | strftime(ansible_facts.date_time.epoch | int) }}.md"
+      delegate_to: localhost
+      run_once: true
+
+    - name: Emit structured fleet-health report for the UI
+      delegate_to: localhost
+      become: false
+      run_once: true
+      check_mode: false
+      when: ui_report_path is defined
+      ansible.builtin.copy:
+        dest: "{{ ui_report_path }}"
+        mode: "0644"
+        content: |-
+          {
+            "report_type": "fleet_health",
+            "generated_at": {{ lookup('pipe', 'date -u +%FT%TZ') | to_json }},
+            "hosts": [
+              {%- for h in ansible_play_hosts_all | sort %}
+              {%- set hv = hostvars[h] %}
+              {%- if hv.reboot_flag is not defined %}
+              { "name": {{ h | to_json }}, "unreachable": true }{% if not loop.last %},{% endif %}
+              {%- else %}
+              {%- set running_kernel = hv.ansible_facts.kernel %}
+              {%- set latest_kernel = hv.latest_kernel.stdout %}
+              {%- set kernel_stale = (latest_kernel != '' and latest_kernel != running_kernel) %}
+              {%- set failed_text = (hv.failed_units.stdout | default('') | trim) %}
+              {%- set failed_count = (failed_text.split('\n') | length) if failed_text else 0 %}
+              {%- set root = hv.ansible_facts.mounts | selectattr('mount', 'equalto', '/') | list %}
+              {%- set max_used_pct = (hv.ansible_facts.mounts | map(attribute='size_total') | list) %}
+              {
+                "name":           {{ h | to_json }},
+                "unreachable":    false,
+                "address":        {{ (hv.ansible_host | default(h)) | to_json }},
+                "distro":         {{ (hv.ansible_facts.distribution ~ ' ' ~ hv.ansible_facts.distribution_version) | to_json }},
+                "uptime":         {{ (hv.uptime_pretty.stdout | default('')) | to_json }},
+                "reboot_required":{{ hv.reboot_flag.stat.exists | to_json }},
+                "kernel_running": {{ running_kernel | to_json }},
+                "kernel_latest":  {{ latest_kernel | to_json }},
+                "kernel_stale":   {{ kernel_stale | to_json }},
+                "failed_units":     {{ failed_count }},
+                "failed_units_raw": {{ failed_text | to_json }},
+                "ram_used_mb":    {{ hv.ansible_facts.memtotal_mb - hv.ansible_facts.memfree_mb }},
+                "ram_total_mb":   {{ hv.ansible_facts.memtotal_mb }},
+                "ram_pct":        {{ ((hv.ansible_facts.memtotal_mb - hv.ansible_facts.memfree_mb) / hv.ansible_facts.memtotal_mb * 100) | round(0) | int }},
+                {%- if root | length > 0 %}
+                "root_used_pct":  {{ ((root[0].size_total - root[0].size_available) / root[0].size_total * 100) | round(0) | int }},
+                "root_total_gb":  {{ (root[0].size_total / 1073741824) | round(1) }},
+                {%- else %}
+                "root_used_pct":  null,
+                "root_total_gb":  null,
+                {%- endif %}
+                "unattended_last": {{ ('%Y-%m-%d %H:%M:%S' | strftime(hv.unattended_log.stat.mtime | int)) | to_json if hv.unattended_log.stat.exists else 'null' }}
+              }{% if not loop.last %},{% endif %}
+              {%- endif %}
+              {%- endfor %}
+            ]
+          }

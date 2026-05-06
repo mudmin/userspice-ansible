@@ -1,0 +1,51 @@
+---
+# memory.yml — show RAM and swap usage per host. Read-only.
+# Uses 'nocache' figures so the "used" number reflects what's actually held by
+# applications, not what the kernel is using as page cache (which is reclaimable).
+# When `ui_report_path` is set, also emits a structured JSON report for the UI.
+#
+#   ansible-playbook memory.yml
+#   ansible-playbook memory.yml --limit nonprod
+#   ansible-playbook memory.yml -e ui_report_path=/tmp/mem.json   # report
+
+- name: Memory usage
+  hosts: all
+  gather_facts: true
+  become: false
+
+  tasks:
+    - name: Per-host memory summary
+      ansible.builtin.debug:
+        msg: |-
+          === {{ inventory_hostname }} ===
+          RAM:  {{ "%5d" | format(ansible_memory_mb.nocache.used) }}M used / {{ "%5d" | format(ansible_memtotal_mb) }}M total  ({{ "%3d" | format((ansible_memory_mb.nocache.used / ansible_memtotal_mb * 100) | round(0) | int) }}% used, page cache excluded)
+          Swap: {{ "%5d" | format(ansible_swaptotal_mb - ansible_swapfree_mb) }}M used / {{ "%5d" | format(ansible_swaptotal_mb) }}M total{% if ansible_swaptotal_mb > 0 %}  ({{ "%3d" | format(((ansible_swaptotal_mb - ansible_swapfree_mb) / ansible_swaptotal_mb * 100) | round(0) | int) }}% used){% else %}  (no swap){% endif %}
+
+  post_tasks:
+    - name: Emit structured memory report for the UI
+      delegate_to: localhost
+      run_once: true
+      check_mode: false
+      when: ui_report_path is defined
+      ansible.builtin.copy:
+        dest: "{{ ui_report_path }}"
+        mode: "0644"
+        content: |-
+          {
+            "report_type": "memory",
+            "generated_at": {{ lookup('pipe', 'date -u +%FT%TZ') | to_json }},
+            "hosts": [
+              {%- for h in ansible_play_hosts_all %}
+              {%- set hv = hostvars[h] %}
+              {
+                "name":         {{ h | to_json }},
+                "ram_used_mb":  {{ hv.ansible_memory_mb.nocache.used }},
+                "ram_total_mb": {{ hv.ansible_memtotal_mb }},
+                "ram_pct":      {{ (hv.ansible_memory_mb.nocache.used / hv.ansible_memtotal_mb * 100) | round(0) | int }},
+                "swap_used_mb": {{ hv.ansible_swaptotal_mb - hv.ansible_swapfree_mb }},
+                "swap_total_mb":{{ hv.ansible_swaptotal_mb }},
+                "swap_pct":     {{ (((hv.ansible_swaptotal_mb - hv.ansible_swapfree_mb) / hv.ansible_swaptotal_mb * 100) | round(0) | int) if hv.ansible_swaptotal_mb > 0 else 0 }}
+              }{% if not loop.last %},{% endif %}
+              {%- endfor %}
+            ]
+          }

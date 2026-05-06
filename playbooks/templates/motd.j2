@@ -1,0 +1,7 @@
+
+──────────────────────────────────────────────────────────────
+ {{ inventory_hostname }}  ({{ group_names | sort | join(', ') }})
+ OS:      {{ ansible_facts.distribution }} {{ ansible_facts.distribution_version }} ({{ ansible_facts.distribution_release }})
+ Managed by Ansible
+ ⚠  Don't edit configs by hand. Edit on the control node and re-run.
+──────────────────────────────────────────────────────────────

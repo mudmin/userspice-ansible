@@ -1,0 +1,156 @@
+---
+# firewall.yml — declarative UFW management, composed from group_vars.
+#
+# Each group's rules live in group_vars/<group>.yml as a variable named
+# `<group>_firewall_rules` (a list of dicts). At run time, this playbook
+# flattens those lists across every group the target host belongs to,
+# producing one effective rule set per host.
+#
+# Rule dict shape (matches community.general.ufw):
+#   { rule: allow|deny|limit|reject,
+#     port: "22",            # required for port rules
+#     proto: tcp|udp|any,    # default 'any'
+#     from_ip: "1.2.3.4",    # optional; default 'any'
+#     comment: "free text",
+#     delete: true }         # optional; removes the matching rule instead
+#                            #   of adding it. Match is on rule+port+proto+
+#                            #   from_ip. Idempotent: no-op if not present.
+#                            #   Used to tear out rules that pre-existed on
+#                            #   a live host (e.g. narrowing a wide-open
+#                            #   port to a CIDR-scoped allow).
+#
+# Safety model:
+#   - Rules are *always* loaded into UFW (idempotent reconcile).
+#   - UFW is only `enabled` on a host when `firewall_enabled: true`
+#     (set in group_vars or host_vars). Default is false.
+#   - This means you can preview a host's effective ruleset against an
+#     INACTIVE ufw before flipping the master switch.
+#
+# First-run protocol on any new host:
+#   ansible-playbook firewall.yml --check --diff --limit <host>
+#   ansible-playbook firewall.yml --tags rules --limit <host>      # load only
+#   # verify in `sudo ufw show added` on the host
+#   # then, when confident:
+#   #   set firewall_enabled: true in host_vars or group_vars and re-run
+#   ansible-playbook firewall.yml --limit <host>
+#
+# Tags:
+#   defaults  — set default in/out policies
+#   rules     — reconcile rule list
+#   enable    — actually turn UFW on (gated by firewall_enabled)
+
+- name: Manage UFW rules from group composition
+  hosts: all
+  become: true
+  gather_facts: true
+
+  pre_tasks:
+    # Two-step ufw install: check first, only invoke apt if missing. Keeps
+    # firewall.yml runnable on hosts where apt update fails (e.g. unreachable
+    # PPA mirrors) but ufw is already present from a prior install — common
+    # on managed VPS that came over from the firewall_tailscale.sh era.
+    - name: Check whether ufw is already installed
+      ansible.builtin.command: dpkg-query -W -f='${Status}' ufw
+      register: ufw_pkg
+      changed_when: false
+      failed_when: false
+      tags: [always]
+
+    - name: Ensure ufw is installed (only if missing)
+      ansible.builtin.apt:
+        name: ufw
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+      when: "'install ok installed' not in ufw_pkg.stdout"
+      tags: [always]
+
+    - name: Build effective firewall rule list from group memberships
+      ansible.builtin.set_fact:
+        effective_firewall_rules: >-
+          {{
+            (effective_firewall_rules | default([])) +
+            lookup('vars', item ~ '_firewall_rules', default=[])
+          }}
+      loop: "{{ ['all'] + group_names }}"
+      tags: [always]
+
+    - name: Show effective firewall rules (for review)
+      ansible.builtin.debug:
+        var: effective_firewall_rules
+      tags: [always]
+
+  tasks:
+    - name: Set default inbound policy
+      community.general.ufw:
+        default: "{{ firewall_default_input }}"
+        direction: incoming
+      tags: [defaults]
+
+    - name: Set default outbound policy
+      community.general.ufw:
+        default: "{{ firewall_default_output }}"
+        direction: outgoing
+      tags: [defaults]
+
+    # ADDS go through community.general.ufw — the module handles add/idempotency
+    # for the common case cleanly.
+    - name: Apply declared firewall rules — ADDS
+      community.general.ufw:
+        rule: "{{ item.rule }}"
+        port: "{{ item.port | default(omit) }}"
+        proto: "{{ item.proto | default('any') }}"
+        from_ip: "{{ item.from_ip | default('any') }}"
+        comment: "{{ item.comment | default(omit) }}"
+      loop: "{{ effective_firewall_rules }}"
+      when: not (item.delete | default(false))
+      loop_control:
+        label: "ALLOW {{ item.port | default('-') }}/{{ item.proto | default('any') }} from {{ item.from_ip | default('any') }}"
+      tags: [rules]
+
+    # DELETES bypass the module and call `ufw delete` directly. The module's
+    # delete pathway has an internal rule-matcher that silently no-ops on
+    # legacy rule shapes (no-proto rules, mismatched comments, etc.) — even
+    # on rules the playbook itself added. Direct shell-out matches by literal
+    # ufw syntax and is reliable. Idempotent: "Could not delete non-existent
+    # rule" is treated as ok (the rule already wasn't there).
+    - name: Apply declared firewall rules — DELETES (direct ufw command)
+      ansible.builtin.shell:
+        # UFW syntax differs by rule shape:
+        #   wide-open:        ufw delete allow 3000          (or 3000/tcp)
+        #   source-restricted: ufw delete allow from X to any port 22 proto tcp
+        # The wide-open form does NOT use the 'port' keyword and breaks
+        # with "Need 'to' or 'from' clause" if you try.
+        cmd: >-
+          ufw --force delete {{ item.rule }}
+          {%- if item.from_ip is defined or item.to_ip is defined %}
+            {%- if item.from_ip is defined %} from {{ item.from_ip }}{% else %} from any{% endif %}
+            {%- if item.to_ip is defined %} to {{ item.to_ip }}{% else %} to any{% endif %}
+            {%- if item.port is defined %} port {{ item.port }}{% endif %}
+            {%- if item.proto is defined and item.proto != 'any' %} proto {{ item.proto }}{% endif %}
+          {%- elif item.port is defined %}
+             {{ item.port }}{% if item.proto is defined and item.proto != 'any' %}/{{ item.proto }}{% endif %}
+          {%- endif %}
+      register: ufw_del
+      changed_when: "'Rule deleted' in ufw_del.stdout"
+      failed_when: >-
+        ufw_del.rc != 0
+        and 'Could not delete non-existent rule' not in ufw_del.stdout
+        and 'Could not delete non-existent rule' not in ufw_del.stderr
+      loop: "{{ effective_firewall_rules }}"
+      when: item.delete | default(false)
+      loop_control:
+        label: "DELETE {{ item.port | default('-') }}/{{ item.proto | default('any') }} from {{ item.from_ip | default('any') }}"
+      tags: [rules]
+
+    - name: Enable UFW (only on hosts with firewall_enabled=true)
+      community.general.ufw:
+        state: enabled
+      when: firewall_enabled | bool
+      tags: [enable]
+
+    - name: Report skipped enablement
+      ansible.builtin.debug:
+        msg: "firewall_enabled is false on this host — UFW left in current state."
+      when: not (firewall_enabled | bool)
+      tags: [enable]

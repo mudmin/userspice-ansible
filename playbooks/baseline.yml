@@ -1,0 +1,159 @@
+---
+# baseline.yml — universal config every fleet host should have.
+#
+# Touches only:
+#   - apt-installed packages (toolkit + ufw inactive + unattended-upgrades)
+#   - /etc/systemd/journald.conf.d/persistent.conf (new file)
+#   - /etc/motd (overwritten with templated banner)
+#   - /etc/update-motd.d/{advertising scripts} (chmod -x)
+#
+# Does NOT touch: timezones, locale, firewall rules, ufw enablement,
+# unattended-upgrades configuration, SSH config, network, web servers.
+#
+# Tags: packages, journald, motd  (run subsets with --tags)
+#
+# First-run protocol:
+#   ansible-playbook baseline.yml --check --diff --limit ans-3
+#   ansible-playbook baseline.yml --limit ans-3
+#   ansible-playbook baseline.yml --limit nonprod
+#   ansible-playbook baseline.yml                 # whole fleet, last
+
+- name: Baseline configuration for fleet hosts
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    baseline_packages:
+      # Standard toolkit
+      - htop
+      - btop
+      - iotop
+      - mtr-tiny
+      - dnsutils
+      - tmux
+      - vim
+      - nano
+      - jq
+      - ripgrep
+      - bash-completion
+      - tree
+      - ncdu
+      - lsof
+      - strace
+      - rsync
+      - zip
+      - unzip
+      # Auto-updates (installed but NOT configured here)
+      - unattended-upgrades
+      # Firewall (installed but NOT enabled here — rules live elsewhere)
+      - ufw
+
+    motd_scripts_to_disable:
+      - 10-help-text
+      - 50-motd-news
+      - 80-livepatch
+      - 91-release-upgrade
+      - 95-hwe-eol
+
+  tasks:
+    - name: Update apt cache (1h validity)
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+      tags: [packages]
+
+    - name: Install baseline package set
+      ansible.builtin.apt:
+        name: "{{ baseline_packages }}"
+        state: present
+      tags: [packages]
+
+    - name: Ensure /etc/systemd/journald.conf.d exists
+      ansible.builtin.file:
+        path: /etc/systemd/journald.conf.d
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+      tags: [journald]
+
+    - name: Configure persistent journald
+      ansible.builtin.copy:
+        dest: /etc/systemd/journald.conf.d/persistent.conf
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          [Journal]
+          Storage=persistent
+          SystemMaxUse=500M
+          SystemKeepFree=1G
+      notify: Restart journald
+      tags: [journald]
+
+    - name: Locate Ubuntu MOTD advertising scripts
+      ansible.builtin.find:
+        paths: /etc/update-motd.d
+        patterns: "{{ motd_scripts_to_disable }}"
+        file_type: file
+      register: motd_advertising
+      tags: [motd]
+
+    - name: Disable advertising MOTD scripts (chmod -x)
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        mode: '0644'
+      loop: "{{ motd_advertising.files }}"
+      loop_control:
+        label: "{{ item.path }}"
+      tags: [motd]
+
+    - name: Render templated /etc/motd
+      ansible.builtin.template:
+        src: templates/motd.j2
+        dest: /etc/motd
+        owner: root
+        group: root
+        mode: '0644'
+      tags: [motd]
+
+    # The chmod -x above stops 50-motd-news from running at login, but the
+    # systemd unit (motd-news.timer → motd-news.service) still fires from
+    # its timer and lands in the failed-units list. Masking the timer +
+    # service completes the disable; reset-failed clears any prior failure
+    # already recorded against the unit.
+    - name: Detect motd-news.service presence
+      ansible.builtin.stat:
+        path: /lib/systemd/system/motd-news.service
+      register: motd_news_unit
+      tags: [motd]
+
+    - name: Mask motd-news.timer + .service
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        masked: true
+        enabled: false
+        state: stopped
+      loop:
+        - motd-news.timer
+        - motd-news.service
+      when: motd_news_unit.stat.exists
+      tags: [motd]
+
+    # reset-failed runs *after* the mask. Stopping an active timer can
+    # transition it to a failed state during the deactivate; doing the
+    # reset post-mask normalizes both units to a clean inactive/masked
+    # state regardless of how they entered the play.
+    - name: Clear any lingering failed state on motd-news (post-mask)
+      ansible.builtin.command: systemctl reset-failed motd-news.timer motd-news.service
+      changed_when: false
+      failed_when: false
+      when: motd_news_unit.stat.exists
+      tags: [motd]
+
+  handlers:
+    - name: Restart journald
+      ansible.builtin.systemd:
+        name: systemd-journald
+        state: restarted

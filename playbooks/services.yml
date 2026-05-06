@@ -1,0 +1,150 @@
+---
+# services.yml — systemd unit health per host. Read-only.
+# Three views:
+#   1. Curated key services (apache2, mariadb/mysql, php-fpm at any
+#      version, ssh, ufw, fail2ban, unattended-upgrades, tailscaled,
+#      systemd-timesyncd) with active/sub/enabled state. Loaded units only.
+#   2. Failed units (full list).
+#   3. Total count of enabled .service unit files (drift signal — wildly
+#      different counts between supposedly-identical hosts is interesting).
+# Failed units are also reported by fleet_health.yml; this view focuses on
+# named services so the UI can render a per-service health column.
+# When `ui_report_path` is set, also emits a structured JSON report for the UI.
+#
+#   ansible-playbook services.yml
+#   ansible-playbook services.yml --limit apache
+#   ansible-playbook services.yml -e ui_report_path=/tmp/svc.json    # report
+
+- name: Systemd service inventory
+  hosts: all
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Probe key services + failed units + enabled count
+      ansible.builtin.shell: |
+        python3 <<'PY'
+        import json, subprocess
+        def sh(cmd):
+            try:
+                return subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode()
+            except Exception:
+                return ''
+        # Probe a fixed list of unit names. Multiple PHP versions can
+        # coexist; we probe the common ones and report whatever is loaded.
+        KEY = [
+            'apache2', 'nginx',
+            'mariadb', 'mysql',
+            'php8.1-fpm', 'php8.2-fpm', 'php8.3-fpm', 'php8.4-fpm',
+            'ssh', 'sshd',
+            'ufw', 'fail2ban',
+            'unattended-upgrades',
+            'tailscaled',
+            'systemd-timesyncd', 'chronyd', 'chrony',
+        ]
+        def status(unit):
+            raw = sh(['systemctl', 'show', unit,
+                      '-p', 'LoadState',
+                      '-p', 'ActiveState',
+                      '-p', 'SubState',
+                      '-p', 'UnitFileState'])
+            d = {}
+            for line in raw.splitlines():
+                if '=' in line:
+                    k, v = line.split('=', 1)
+                    d[k] = v
+            return d
+        key_loaded = []
+        for u in KEY:
+            s = status(u)
+            if s.get('LoadState') == 'loaded':
+                key_loaded.append({
+                    'unit':    u,
+                    'active':  s.get('ActiveState', ''),
+                    'sub':     s.get('SubState', ''),
+                    'enabled': s.get('UnitFileState', ''),
+                })
+        failed_raw = sh(['systemctl', 'list-units', '--state=failed',
+                         '--no-legend', '--plain'])
+        failed = []
+        for line in failed_raw.splitlines():
+            parts = line.split(None, 4)
+            if not parts:
+                continue
+            failed.append(parts[0])
+        enabled_raw = sh(['systemctl', 'list-unit-files',
+                          '--state=enabled', '--type=service',
+                          '--no-legend'])
+        enabled_count = sum(1 for line in enabled_raw.splitlines() if line.strip())
+        print(json.dumps({
+            'key':           key_loaded,
+            'failed':        failed,
+            'enabled_count': enabled_count,
+        }))
+        PY
+      args:
+        executable: /bin/bash
+      register: svc_json
+      changed_when: false
+
+    - name: Stash per-host service records
+      ansible.builtin.set_fact:
+        svc_key:           "{{ (svc_json.stdout | from_json).key }}"
+        svc_failed:        "{{ (svc_json.stdout | from_json).failed }}"
+        svc_enabled_count: "{{ (svc_json.stdout | from_json).enabled_count }}"
+
+    - name: Per-host service summary
+      ansible.builtin.debug:
+        msg: |-
+          === {{ inventory_hostname }} ===
+          Enabled .service units: {{ svc_enabled_count }}
+          {% if svc_failed | length > 0 %}
+          FAILED:
+          {% for u in svc_failed %}
+          - {{ u }}
+          {% endfor %}
+          {% else %}
+          Failed: none
+          {% endif %}
+          {% if svc_key | length > 0 %}
+          Key services:
+          {% for s in svc_key %}
+          {{ "%-22s" | format(s.unit) }}  {{ "%-10s" | format(s.active) }}  {{ "%-10s" | format(s.sub) }}  ({{ s.enabled }})
+          {% endfor %}
+          {% endif %}
+
+  post_tasks:
+    - name: Emit structured services report for the UI
+      delegate_to: localhost
+      become: false
+      run_once: true
+      check_mode: false
+      when: ui_report_path is defined
+      ansible.builtin.copy:
+        dest: "{{ ui_report_path }}"
+        mode: "0644"
+        content: |-
+          {
+            "report_type": "services",
+            "generated_at": {{ lookup('pipe', 'date -u +%FT%TZ') | to_json }},
+            "hosts": [
+              {%- for h in ansible_play_hosts_all | sort %}
+              {%- set hv = hostvars[h] %}
+              {
+                "name":          {{ h | to_json }},
+                "enabled_count": {{ (hv.svc_enabled_count | default(0)) | int }},
+                "failed":        {{ (hv.svc_failed | default([])) | to_json }},
+                "key": [
+                  {%- for s in (hv.svc_key | default([])) %}
+                  {
+                    "unit":    {{ s.unit    | to_json }},
+                    "active":  {{ s.active  | to_json }},
+                    "sub":     {{ s.sub     | to_json }},
+                    "enabled": {{ s.enabled | to_json }}
+                  }{% if not loop.last %},{% endif %}
+                  {%- endfor %}
+                ]
+              }{% if not loop.last %},{% endif %}
+              {%- endfor %}
+            ]
+          }

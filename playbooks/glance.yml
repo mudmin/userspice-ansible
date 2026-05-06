@@ -1,0 +1,95 @@
+---
+# glance.yml — one-block-per-host system overview. Read-only.
+# Combines uptime, load, RAM, root disk, kernel, and reboot-required into a
+# single stdout block per host. The "I just want to know if anything's on fire"
+# playbook.
+# When `ui_report_path` is set, also emits a structured JSON report for the UI.
+#
+#   ansible-playbook glance.yml
+#   ansible-playbook glance.yml --limit omt_servers
+#   ansible-playbook glance.yml -e ui_report_path=/tmp/g.json   # report
+
+- name: System glance
+  hosts: all
+  gather_facts: true
+  become: false
+
+  tasks:
+    - name: Read load average
+      ansible.builtin.command: cat /proc/loadavg
+      register: loadavg
+      changed_when: false
+
+    - name: Check for reboot-required flag
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_flag
+
+    - name: Per-host glance
+      ansible.builtin.debug:
+        msg: |-
+          === {{ inventory_hostname }} ({{ ansible_distribution }} {{ ansible_distribution_version }}, kernel {{ ansible_kernel }}) ===
+          Uptime:    {{ (ansible_uptime_seconds / 86400) | round(1) }} days
+          Load:      {{ loadavg.stdout.split()[0] }} / {{ loadavg.stdout.split()[1] }} / {{ loadavg.stdout.split()[2] }}  (1m / 5m / 15m, {{ ansible_processor_vcpus }} vCPU)
+          RAM:       {{ ansible_memory_mb.nocache.used }}M / {{ ansible_memtotal_mb }}M  ({{ (ansible_memory_mb.nocache.used / ansible_memtotal_mb * 100) | round(0) | int }}% used)
+          Root disk: {% set root = ansible_mounts | selectattr('mount', 'equalto', '/') | first %}{{ ((root.size_total - root.size_available) / 1024 / 1024 / 1024) | round(1) }}G / {{ (root.size_total / 1024 / 1024 / 1024) | round(1) }}G  ({{ ((root.size_total - root.size_available) / root.size_total * 100) | round(0) | int }}% used)
+          Reboot:    {{ 'REQUIRED' if reboot_flag.stat.exists else 'no' }}
+
+    - name: Stash per-host glance facts for the report aggregator
+      when: ui_report_path is defined
+      ansible.builtin.set_fact:
+        ui_glance_record:
+          name:        "{{ inventory_hostname }}"
+          distro:      "{{ ansible_distribution }} {{ ansible_distribution_version }}"
+          kernel:      "{{ ansible_kernel }}"
+          uptime_days: "{{ (ansible_uptime_seconds / 86400) | round(1) }}"
+          load_1m:     "{{ loadavg.stdout.split()[0] }}"
+          load_5m:     "{{ loadavg.stdout.split()[1] }}"
+          load_15m:    "{{ loadavg.stdout.split()[2] }}"
+          vcpus:       "{{ ansible_processor_vcpus }}"
+          ram_used_mb:     "{{ ansible_memory_mb.nocache.used }}"
+          ram_total_mb:    "{{ ansible_memtotal_mb }}"
+          ram_pct:         "{{ (ansible_memory_mb.nocache.used / ansible_memtotal_mb * 100) | round(0) | int }}"
+          root_used_gb:    "{{ ((root.size_total - root.size_available) / 1073741824) | round(1) }}"
+          root_total_gb:   "{{ (root.size_total / 1073741824) | round(1) }}"
+          root_pct:        "{{ ((root.size_total - root.size_available) / root.size_total * 100) | round(0) | int }}"
+          reboot_required: "{{ reboot_flag.stat.exists }}"
+      vars:
+        root: "{{ ansible_mounts | selectattr('mount', 'equalto', '/') | first }}"
+
+  post_tasks:
+    - name: Emit structured glance report for the UI
+      delegate_to: localhost
+      run_once: true
+      check_mode: false
+      when: ui_report_path is defined
+      ansible.builtin.copy:
+        dest: "{{ ui_report_path }}"
+        mode: "0644"
+        content: |-
+          {
+            "report_type": "glance",
+            "generated_at": {{ lookup('pipe', 'date -u +%FT%TZ') | to_json }},
+            "hosts": [
+              {%- for h in ansible_play_hosts_all %}
+              {%- set r = hostvars[h].ui_glance_record %}
+              {
+                "name":            {{ r.name        | to_json }},
+                "distro":          {{ r.distro      | to_json }},
+                "kernel":          {{ r.kernel      | to_json }},
+                "uptime_days":     {{ r.uptime_days }},
+                "load_1m":         {{ r.load_1m  | float }},
+                "load_5m":         {{ r.load_5m  | float }},
+                "load_15m":        {{ r.load_15m | float }},
+                "vcpus":           {{ r.vcpus | int }},
+                "ram_used_mb":     {{ r.ram_used_mb | int }},
+                "ram_total_mb":    {{ r.ram_total_mb | int }},
+                "ram_pct":         {{ r.ram_pct | int }},
+                "root_used_gb":    {{ r.root_used_gb }},
+                "root_total_gb":   {{ r.root_total_gb }},
+                "root_pct":        {{ r.root_pct | int }},
+                "reboot_required": {{ (r.reboot_required | bool) | to_json }}
+              }{% if not loop.last %},{% endif %}
+              {%- endfor %}
+            ]
+          }

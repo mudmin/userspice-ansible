@@ -1,0 +1,140 @@
+---
+# packages.yml — installed-version drift across the fleet. Read-only.
+# Two views per host:
+#   1. A curated list of "things we care about" — Apache, MariaDB/MySQL,
+#      PHP, certbot, ufw, etc. — with installed/missing + version. Drives
+#      the "is this host on the same PHP as the others?" question.
+#   2. Every php-* package and its version, since multi-PHP installs are
+#      where drift hides (host A on php8.1-fpm, host B on php8.3-fpm).
+# dpkg-query is unprivileged, so the play runs without become.
+# When `ui_report_path` is set, also emits a structured JSON report for the UI.
+#
+#   ansible-playbook packages.yml
+#   ansible-playbook packages.yml --limit apache
+#   ansible-playbook packages.yml -e ui_report_path=/tmp/pkgs.json   # report
+
+- name: Installed package versions
+  hosts: all
+  become: false
+  gather_facts: true   # we surface ansible_distribution as host context
+
+  tasks:
+    - name: Query dpkg for curated packages + every php-*
+      ansible.builtin.shell: |
+        python3 <<'PY'
+        import json, subprocess
+        CURATED = [
+            'apache2',
+            'mariadb-server', 'mysql-server',
+            'php', 'php-cli', 'php-fpm',
+            'nginx',
+            'nodejs',
+            'certbot',
+            'ufw',
+            'fail2ban',
+            'openssh-server',
+            'unattended-upgrades',
+            'tailscale',
+        ]
+        def query_one(pkg):
+            try:
+                out = subprocess.check_output(
+                    ['dpkg-query', '-W', '-f', '${Status}|${Version}', pkg],
+                    stderr=subprocess.DEVNULL,
+                ).decode().strip()
+            except Exception:
+                return None
+            if '|' not in out:
+                return None
+            status, ver = out.split('|', 1)
+            if 'install ok installed' in status:
+                return ver
+            return None
+        curated = [{'name': p, 'version': query_one(p), 'installed': query_one(p) is not None}
+                   for p in CURATED]
+        # Glob query for every php-*. dpkg-query supports shell-style wildcards.
+        try:
+            php_raw = subprocess.check_output(
+                ['dpkg-query', '-W', '-f', '${Package}\t${Version}\t${Status}\n', 'php*'],
+                stderr=subprocess.DEVNULL,
+            ).decode()
+        except Exception:
+            php_raw = ''
+        php_pkgs = []
+        for line in php_raw.splitlines():
+            parts = line.split('\t')
+            if len(parts) < 3:
+                continue
+            name, ver, status = parts[0], parts[1], parts[2]
+            if 'install ok installed' not in status:
+                continue
+            php_pkgs.append({'name': name, 'version': ver})
+        php_pkgs.sort(key=lambda r: r['name'])
+        print(json.dumps({'curated': curated, 'php_pkgs': php_pkgs}))
+        PY
+      args:
+        executable: /bin/bash
+      register: pkg_json
+      changed_when: false
+
+    - name: Stash per-host package records
+      ansible.builtin.set_fact:
+        pkg_curated: "{{ (pkg_json.stdout | from_json).curated }}"
+        pkg_php:     "{{ (pkg_json.stdout | from_json).php_pkgs }}"
+
+    - name: Per-host package summary
+      ansible.builtin.debug:
+        msg: |-
+          === {{ inventory_hostname }} ({{ ansible_facts.distribution }} {{ ansible_facts.distribution_version }}) ===
+          Curated:
+          {% for p in pkg_curated %}
+          {{ "%-22s" | format(p.name) }}  {{ p.version if p.installed else '(not installed)' }}
+          {% endfor %}
+          {% if pkg_php | length > 0 %}
+          PHP packages:
+          {% for p in pkg_php %}
+          {{ "%-30s" | format(p.name) }}  {{ p.version }}
+          {% endfor %}
+          {% endif %}
+
+  post_tasks:
+    - name: Emit structured packages report for the UI
+      delegate_to: localhost
+      become: false
+      run_once: true
+      check_mode: false
+      when: ui_report_path is defined
+      ansible.builtin.copy:
+        dest: "{{ ui_report_path }}"
+        mode: "0644"
+        content: |-
+          {
+            "report_type": "packages",
+            "generated_at": {{ lookup('pipe', 'date -u +%FT%TZ') | to_json }},
+            "hosts": [
+              {%- for h in ansible_play_hosts_all | sort %}
+              {%- set hv = hostvars[h] %}
+              {
+                "name":   {{ h | to_json }},
+                "distro": {{ ((hv.ansible_facts.distribution ~ ' ' ~ hv.ansible_facts.distribution_version) if hv.ansible_facts is defined else '') | to_json }},
+                "curated": [
+                  {%- for p in (hv.pkg_curated | default([])) %}
+                  {
+                    "name":      {{ p.name      | to_json }},
+                    "version":   {{ p.version   | to_json }},
+                    "installed": {{ p.installed | to_json }}
+                  }{% if not loop.last %},{% endif %}
+                  {%- endfor %}
+                ],
+                "php_pkgs": [
+                  {%- for p in (hv.pkg_php | default([])) %}
+                  {
+                    "name":    {{ p.name    | to_json }},
+                    "version": {{ p.version | to_json }}
+                  }{% if not loop.last %},{% endif %}
+                  {%- endfor %}
+                ]
+              }{% if not loop.last %},{% endif %}
+              {%- endfor %}
+            ]
+          }

@@ -1,0 +1,100 @@
+---
+# grep_log.yml — search a whitelisted log file (or journal) for a
+# pattern, with optional context lines. Read-only.
+#
+# UI_PARAMS:
+#   log:          enum(apache_error|apache_access|mariadb_error|syslog|journalctl) required
+#   pattern:      string required max_length=200
+#   pattern_type: enum(plain|regex) required default=plain
+#   context:      int default=0 min=0 max=10
+#
+# pattern_type=plain → grep -F (fixed-string match)
+# pattern_type=regex → grep -E (extended regex)
+# Either way the pattern is passed to grep as an argv element, never
+# interpolated into a shell command, so values like `; rm -rf /` are
+# harmless — grep treats them as literal search input.
+#
+# Hosts where the named log doesn't exist return exists:false with no
+# lines, so a fleet-wide grep across mixed hosts skips gracefully.
+#
+# When `ui_report_path` is set, also emits a structured JSON report.
+#
+#   ansible-playbook grep_log.yml --limit deploy-spice -e log=apache_error -e pattern=ERROR
+#   ansible-playbook grep_log.yml --limit apache       -e log=apache_error -e pattern_type=regex -e 'pattern=^\[error\]' -e context=2
+#   ansible-playbook grep_log.yml --limit nonprod      -e log=syslog       -e pattern=denied -e ui_report_path=/tmp/g.json
+
+- name: Grep log
+  hosts: all
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Validate parameters
+      ansible.builtin.assert:
+        that:
+          - log is defined
+          - log in ['apache_error', 'apache_access', 'mariadb_error', 'syslog', 'journalctl']
+          - pattern is defined
+          - pattern | length >= 1
+          - pattern | length <= 200
+          - pattern_type | default('plain') in ['plain', 'regex']
+          - (context | default(0)) | int >= 0
+          - (context | default(0)) | int <= 10
+        fail_msg: "log must be in the whitelist; pattern 1..200 chars; pattern_type plain|regex; context 0..10"
+        quiet: true
+
+    - name: Run scripts/grep_log.py
+      ansible.builtin.script: "scripts/grep_log.py {{ log }} {{ pattern_type | default('plain') }} {{ pattern | quote }} {{ (context | default(0)) | int }}"
+      args:
+        executable: python3
+      register: grep_log_json
+      changed_when: false
+
+    - name: Stash per-host grep_log record
+      ansible.builtin.set_fact:
+        grep_log_record: "{{ grep_log_json.stdout | from_json }}"
+
+    - name: Per-host grep_log summary
+      ansible.builtin.debug:
+        msg: |-
+          === {{ inventory_hostname }} ===
+          {{ grep_log_record.path }} (pattern_type={{ grep_log_record.pattern_type }}): {{ grep_log_record.line_count }} matching lines{% if not grep_log_record.exists %}  (log not present){% endif %}
+
+  post_tasks:
+    - name: Emit structured grep_log report for the UI
+      delegate_to: localhost
+      become: false
+      run_once: true
+      check_mode: false
+      when: ui_report_path is defined
+      ansible.builtin.copy:
+        dest: "{{ ui_report_path }}"
+        mode: "0644"
+        content: |-
+          {
+            "report_type": "grep_log",
+            "generated_at": {{ lookup('pipe', 'date -u +%FT%TZ') | to_json }},
+            "params": {
+              "log":          {{ log | to_json }},
+              "pattern":      {{ pattern | to_json }},
+              "pattern_type": {{ (pattern_type | default('plain')) | to_json }},
+              "context":      {{ (context | default(0)) | int }}
+            },
+            "hosts": [
+              {%- for h in ansible_play_hosts_all | sort %}
+              {%- set hv = hostvars[h] %}
+              {%- set r = hv.grep_log_record | default({}) %}
+              {
+                "name":         {{ h | to_json }},
+                "log_key":      {{ (r.log_key      | default('')) | to_json }},
+                "path":         {{ (r.path         | default('')) | to_json }},
+                "pattern":      {{ (r.pattern      | default('')) | to_json }},
+                "pattern_type": {{ (r.pattern_type | default('')) | to_json }},
+                "context":      {{ (r.context      | default(0)) | int }},
+                "exists":       {{ (r.exists       | default(false)) | to_json }},
+                "lines":        {{ (r.lines        | default([])) | to_json }},
+                "line_count":   {{ (r.line_count   | default(0)) | int }}
+              }{% if not loop.last %},{% endif %}
+              {%- endfor %}
+            ]
+          }

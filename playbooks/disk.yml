@@ -1,0 +1,56 @@
+---
+# disk.yml — show disk usage per mount on every host. Read-only.
+# Renders a per-host block to stdout. If `ui_report_path` is set (the
+# ansible-ui passes it as an extra-var), also emits a structured JSON
+# report at that path so the UI can render a table/chart.
+#
+#   ansible-playbook disk.yml
+#   ansible-playbook disk.yml --limit managed_vps
+#   ansible-playbook disk.yml -e ui_report_path=/tmp/disk.json   # report
+
+- name: Disk free
+  hosts: all
+  gather_facts: true
+  become: false
+
+  tasks:
+    - name: Per-host disk summary
+      ansible.builtin.debug:
+        msg: |-
+          === {{ inventory_hostname }} ===
+          {% for m in ansible_mounts | sort(attribute='mount') %}
+          {{ "%-25s" | format(m.mount) }}  {{ "%6.1f" | format(m.size_total / 1024 / 1024 / 1024) }}G total  {{ "%6.1f" | format(m.size_available / 1024 / 1024 / 1024) }}G free  {{ "%3d" | format(((m.size_total - m.size_available) / m.size_total * 100) | round(0) | int) }}% used  ({{ m.fstype }})
+          {% endfor %}
+
+  post_tasks:
+    - name: Emit structured disk report for the UI
+      delegate_to: localhost
+      run_once: true
+      check_mode: false
+      when: ui_report_path is defined
+      ansible.builtin.copy:
+        dest: "{{ ui_report_path }}"
+        mode: "0644"
+        content: |-
+          {
+            "report_type": "disk",
+            "generated_at": {{ lookup('pipe', 'date -u +%FT%TZ') | to_json }},
+            "hosts": [
+              {%- for h in ansible_play_hosts_all %}
+              {
+                "name": {{ h | to_json }},
+                "mounts": [
+                  {%- for m in (hostvars[h].ansible_mounts | sort(attribute='mount')) %}
+                  {
+                    "mount":    {{ m.mount  | to_json }},
+                    "fstype":   {{ m.fstype | to_json }},
+                    "size_gb":  {{ (m.size_total     / 1073741824) | round(1) }},
+                    "free_gb":  {{ (m.size_available / 1073741824) | round(1) }},
+                    "used_pct": {{ ((m.size_total - m.size_available) / m.size_total * 100) | round(0) | int }}
+                  }{% if not loop.last %},{% endif %}
+                  {%- endfor %}
+                ]
+              }{% if not loop.last %},{% endif %}
+              {%- endfor %}
+            ]
+          }
