@@ -485,7 +485,15 @@ set -e
 
 cd /var/www/html/userspice-ansible/ansible
 
-# -H so HOME is www-data's home (/var/www) — composer's cache lands there
+# Ensure www-data has a writable composer cache dir under its home.
+# (On a fresh install, /var/www/.cache doesn't exist yet — composer warns
+# and proceeds without cache, but it's cleaner to create it up front.)
+mkdir -p /var/www/.cache
+chown -R www-data:www-data /var/www/.cache
+
+# -H so HOME is www-data's home (/var/www) — composer's cache lands there.
+# composer.lock SHIPS in the repo, so this runs `install` (reproducible)
+# rather than `update` (latest-version resolve).
 sudo -H -u www-data composer install --no-dev --no-interaction --quiet
 
 # Render config.php from config.example.php
@@ -536,6 +544,7 @@ pct exec "$CTID" -- env \
     ADMIN_PW="$ADMIN_PW" \
     COOKIE_NAME="$COOKIE_NAME" \
     SESSION_NAME="$SESSION_NAME" \
+    LXC_HOSTNAME="$HOSTNAME" \
     bash <<'DBSCRIPT'
 set -e
 
@@ -576,12 +585,34 @@ chown www-data:www-data /var/www/html/userspice-ansible/users/init.php
 chmod 640 /var/www/html/userspice-ansible/users/init.php
 
 # Bootstrap an inventory.ini if none exists
-if [[ ! -f /var/www/html/userspice-ansible/playbooks/inventory.ini ]]; then
-    cp /var/www/html/userspice-ansible/playbooks/inventory.example.ini \
-       /var/www/html/userspice-ansible/playbooks/inventory.ini
-    chown www-data:ansible /var/www/html/userspice-ansible/playbooks/inventory.ini
-    chmod 664 /var/www/html/userspice-ansible/playbooks/inventory.ini
+INVENTORY=/var/www/html/userspice-ansible/playbooks/inventory.ini
+if [[ ! -f "$INVENTORY" ]]; then
+    cp /var/www/html/userspice-ansible/playbooks/inventory.example.ini "$INVENTORY"
 fi
+
+# Pre-register the LXC itself as a read-only managed host. Uses the
+# `local` connection (no SSH, runs as www-data) so playbooks that don't
+# need root work immediately — disk.yml, memory.yml, glance.yml, etc.
+# Playbooks with `become: true` (firewall, services, certs) will fail
+# with "cannot escalate" — that's intentional. Mutating the control
+# node from the UI would risk locking the user out, so it's blocked
+# by design. Configure a remote host for those playbooks.
+if ! grep -q '^\[local\]' "$INVENTORY"; then
+    cat >> "$INVENTORY" <<INVENTORY_LOCAL
+
+# --- The control node itself (this LXC) ---
+# Pre-registered at install time as READ-ONLY. The local connection
+# runs as www-data with no sudo, so mutating playbooks (anything with
+# become: true) will fail — that's intentional. To enable full
+# management of the LXC from the UI, replace this block with:
+#   $LXC_HOSTNAME ansible_host=localhost ansible_user=root
+# and add www-data's pubkey to /root/.ssh/authorized_keys.
+[local]
+$LXC_HOSTNAME ansible_connection=local
+INVENTORY_LOCAL
+fi
+chown www-data:ansible "$INVENTORY"
+chmod 664 "$INVENTORY"
 DBSCRIPT
 ok "Database imported, admin user set, init.php rendered"
 
