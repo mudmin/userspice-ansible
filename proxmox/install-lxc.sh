@@ -293,13 +293,15 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -q
 apt-get upgrade -yq
 
-# LAMP + Ansible + tooling
+# LAMP + Ansible + tooling. Composer is required for the ansible-ui PHP
+# module's dependencies (vendor/autoload.php).
 apt-get install -yq --no-install-recommends \
     apache2 mariadb-server \
     php php-cli php-mysql php-xml php-mbstring php-curl php-zip php-gd php-intl \
     libapache2-mod-php \
     ansible \
-    git curl wget unzip openssh-server openssh-client sudo ca-certificates openssl
+    git curl wget unzip openssh-server openssh-client sudo ca-certificates openssl \
+    composer
 
 systemctl enable --now apache2
 systemctl enable --now mariadb
@@ -473,11 +475,49 @@ chmod 775 '/var/www/html/${REPO_DIR_NAME}/ansible/runs'
 fi
 ok "Repo cloned, permissions set"
 
-# ---- Apache: deny direct HTTP access to playbooks/ ----
-step "Configuring Apache deny block on playbooks/"
+# ---- Composer install + render ansible/config.php ----
+# The ansible-ui PHP module uses Composer dependencies (vendor/autoload.php)
+# and a per-install config.php that's gitignored. Both must be created at
+# install time or the dashboard 500s on first load.
+step "Installing composer dependencies and rendering ansible/config.php"
+pct exec "$CTID" -- bash <<'COMPOSERSCRIPT'
+set -e
+
+cd /var/www/html/userspice-ansible/ansible
+
+# -H so HOME is www-data's home (/var/www) — composer's cache lands there
+sudo -H -u www-data composer install --no-dev --no-interaction --quiet
+
+# Render config.php from config.example.php
+SECRET=$(php -r 'echo bin2hex(random_bytes(32));')
+cp config.example.php config.php
+sed -i \
+    -e "s|/home/ansible/ansible|/var/www/html/userspice-ansible/playbooks|" \
+    -e "s|/home/ansible/.local/bin|/usr/bin|" \
+    -e "s|CHANGE_ME_LONG_RANDOM_HEX|${SECRET}|" \
+    config.php
+chown www-data:www-data config.php vendor
+chown -R www-data:www-data vendor
+chmod 640 config.php
+COMPOSERSCRIPT
+ok "Composer dependencies installed, ansible/config.php rendered"
+
+# ---- Apache: mod_rewrite, .htaccess overrides, deny on playbooks/ ----
+step "Configuring Apache (mod_rewrite, AllowOverride, playbooks deny)"
 pct exec "$CTID" -- bash <<'APACHECONFIG'
 set -e
+
+# UserSpice ships .htaccess files with rewrite rules — both must be on.
+a2enmod rewrite >/dev/null 2>&1
+
 cat > /etc/apache2/conf-available/99-userspice-ansible-app.conf <<'CONF'
+# Allow UserSpice's .htaccess files to take effect (mod_rewrite rules, etc.)
+<Directory /var/www/html/userspice-ansible>
+    AllowOverride All
+</Directory>
+
+# Block direct HTTP access to the playbooks tree. PHP exec still reads it
+# fine — only HTTP serving is denied.
 <Directory /var/www/html/userspice-ansible/playbooks>
     Require all denied
 </Directory>
@@ -485,7 +525,7 @@ CONF
 a2enconf 99-userspice-ansible-app >/dev/null 2>&1 || true
 systemctl reload apache2
 APACHECONFIG
-ok "playbooks/ is HTTP-denied (PHP exec still works)"
+ok "mod_rewrite + AllowOverride enabled, playbooks/ HTTP-denied"
 
 # ---- Database setup, schema import, admin user, init.php render ----
 step "Setting up database, importing schema, configuring admin user"
