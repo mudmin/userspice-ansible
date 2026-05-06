@@ -316,11 +316,28 @@ SSHCFG
 systemctl restart ssh
 
 # Groups: ansible (for /playbooks ownership), webdev (general).
-# www-data is in the ansible group so PHP can read the playbooks but not write.
 groupadd -f ansible
 groupadd -f webdev
+
+# Dedicated `ansible` system user owns the playbook tree and runs ansible
+# binaries via sudo from the web UI. Sudoers rule (below) restricts which
+# binaries www-data can invoke as ansible — keeps a vault password file (if
+# set up later) out of www-data's reach. Use existing 'ansible' group as the
+# user's primary group (-g) so we don't get a duplicate-group error.
+useradd -m -d /home/ansible -s /bin/bash -g ansible ansible 2>/dev/null || true
+
 usermod -aG ansible www-data
 usermod -aG webdev www-data
+
+# Sudoers rule: www-data can run ansible binaries as the ansible user with
+# no password. The dev codebase's includes/helper.php hardcodes this pattern
+# (sudo -n -H -u ansible -- ansible-inventory ...) so the rule is required
+# for the web UI to invoke ansible at all.
+cat > /etc/sudoers.d/ansible-ui <<'SUDOERS'
+www-data ALL=(ansible) NOPASSWD: /usr/bin/ansible, /usr/bin/ansible-playbook, /usr/bin/ansible-inventory, /usr/bin/ansible-vault
+SUDOERS
+chmod 0440 /etc/sudoers.d/ansible-ui
+visudo -cf /etc/sudoers.d/ansible-ui >/dev/null
 
 # MariaDB root password (chained auth: socket-as-root + password-as-mysql_native)
 mariadb <<SQL
@@ -361,17 +378,19 @@ PHPINI
     fi
 done
 
-# Generate a dedicated SSH key for www-data so PHP can ssh to fleet hosts.
-# Key lives at /var/www/.ssh/id_ed25519 (www-data's home).
-mkdir -p /var/www/.ssh
-chown www-data:www-data /var/www/.ssh
-chmod 700 /var/www/.ssh
-if [[ ! -f /var/www/.ssh/id_ed25519 ]]; then
-    sudo -u www-data ssh-keygen -t ed25519 -f /var/www/.ssh/id_ed25519 -N "" -C "userspice-ansible@$(hostname)"
+# SSH key for fleet access lives in the ansible user's home — that's the
+# user that actually runs ansible-playbook (via sudo from www-data). Keep
+# it at /home/ansible/.ssh/id_ed25519 so ansible_ssh_private_key_file=
+# ~/.ssh/id_ed25519 in the inventory resolves correctly.
+mkdir -p /home/ansible/.ssh
+chmod 700 /home/ansible/.ssh
+if [[ ! -f /home/ansible/.ssh/id_ed25519 ]]; then
+    sudo -u ansible ssh-keygen -t ed25519 -f /home/ansible/.ssh/id_ed25519 -N "" -C "userspice-ansible@$(hostname)"
 fi
-touch /var/www/.ssh/known_hosts
-chown www-data:www-data /var/www/.ssh/known_hosts
-chmod 644 /var/www/.ssh/known_hosts
+touch /home/ansible/.ssh/known_hosts
+chown -R ansible:ansible /home/ansible/.ssh
+chmod 644 /home/ansible/.ssh/known_hosts /home/ansible/.ssh/id_ed25519.pub
+chmod 600 /home/ansible/.ssh/id_ed25519
 
 # Optional: restrict all web access to a single IP via Apache Require.
 if [[ -n "$RESTRICT_IP" ]]; then
@@ -393,14 +412,15 @@ INDEXPHP
 chown www-data:www-data /var/www/html/index.php
 
 # Wrapper so users can just type `add-server` instead of remembering the
-# `sudo -u www-data /var/www/html/.../add_server.sh` invocation. We re-exec
-# as www-data because add_server.sh uses $HOME/.ssh/id_ed25519, and the web
-# UI runs as www-data — both must use the same key.
+# sudo invocation. Re-execs as the ansible user since add_server.sh uses
+# $HOME/.ssh/id_ed25519 and writes inventory.ini / host_vars/, all of
+# which live under the ansible user.
 cat > /usr/local/bin/add-server <<'WRAPPER'
 #!/bin/bash
 # Onboard a new host into the Ansible fleet (interactive wizard).
-# Runs add_server.sh as www-data so SSH keys match what the web UI uses.
-exec sudo -u www-data --preserve-env=DEBUG \
+# Runs add_server.sh as the ansible user so SSH keys + inventory ownership
+# stay consistent with what the web UI uses.
+exec sudo -u ansible --preserve-env=DEBUG \
     /var/www/html/userspice-ansible/playbooks/add_server.sh "$@"
 WRAPPER
 chmod +x /usr/local/bin/add-server
@@ -425,7 +445,7 @@ cat <<EOF
       add-server
 
   Ping all hosts in your inventory:
-      sudo -u www-data ansible \\
+      sudo -n -H -u ansible ansible \\
           -i /var/www/html/userspice-ansible/playbooks/inventory.ini \\
           all -m ping
 
@@ -457,17 +477,23 @@ set -e
 cd /var/www/html
 git clone '$REPO_URL' '$REPO_DIR_NAME'
 
-# Ownership: web UI files owned by www-data:www-data; playbooks owned by
-# www-data:ansible so future admin users in the ansible group can edit them.
+# Ownership model:
+#   - Web UI files (PHP, users/, usersc/, ansible/): www-data:www-data
+#   - Playbook tree: ansible:ansible (the ansible user is who runs them)
+#   - Runs directory: www-data:ansible 2775 — both users write to it.
+#     www-data writes the run header + log; ansible writes structured
+#     reports via delegate_to: localhost in the playbooks.
 chown -R www-data:www-data '/var/www/html/${REPO_DIR_NAME}'
-chown -R www-data:ansible  '/var/www/html/${REPO_DIR_NAME}/playbooks'
-chmod -R g+rw '/var/www/html/${REPO_DIR_NAME}/playbooks'
-find '/var/www/html/${REPO_DIR_NAME}/playbooks' -type d -exec chmod g+s {} \;
 
-# Runs directory must be writable by www-data
+chown -R ansible:ansible   '/var/www/html/${REPO_DIR_NAME}/playbooks'
+find '/var/www/html/${REPO_DIR_NAME}/playbooks' -type d -exec chmod 2775 {} \;
+find '/var/www/html/${REPO_DIR_NAME}/playbooks' -type f -exec chmod 664 {} \;
+find '/var/www/html/${REPO_DIR_NAME}/playbooks' -name '*.sh' -exec chmod 775 {} \;
+find '/var/www/html/${REPO_DIR_NAME}/playbooks' -name '*.py' -exec chmod 775 {} \;
+
 mkdir -p '/var/www/html/${REPO_DIR_NAME}/ansible/runs'
-chown www-data:www-data '/var/www/html/${REPO_DIR_NAME}/ansible/runs'
-chmod 775 '/var/www/html/${REPO_DIR_NAME}/ansible/runs'
+chown www-data:ansible '/var/www/html/${REPO_DIR_NAME}/ansible/runs'
+chmod 2775 '/var/www/html/${REPO_DIR_NAME}/ansible/runs'
 "; then
     cleanup_on_fail
     fail "Clone failed."
@@ -488,8 +514,8 @@ cd /var/www/html/userspice-ansible/ansible
 # Ensure www-data has a writable composer cache dir under its home.
 # (On a fresh install, /var/www/.cache doesn't exist yet — composer warns
 # and proceeds without cache, but it's cleaner to create it up front.)
-mkdir -p /var/www/.cache
-chown -R www-data:www-data /var/www/.cache
+mkdir -p /var/www/.cache /var/www/.config/composer
+chown -R www-data:www-data /var/www/.cache /var/www/.config
 
 # -H so HOME is www-data's home (/var/www) — composer's cache lands there.
 # composer.lock SHIPS in the repo, so this runs `install` (reproducible)
@@ -589,6 +615,7 @@ INVENTORY=/var/www/html/userspice-ansible/playbooks/inventory.ini
 if [[ ! -f "$INVENTORY" ]]; then
     cp /var/www/html/userspice-ansible/playbooks/inventory.example.ini "$INVENTORY"
 fi
+chown ansible:ansible "$INVENTORY"
 
 # Pre-register the LXC itself as a read-only managed host. Uses the
 # `local` connection (no SSH, runs as www-data) so playbooks that don't
@@ -611,7 +638,7 @@ if ! grep -q '^\[local\]' "$INVENTORY"; then
 $LXC_HOSTNAME ansible_connection=local
 INVENTORY_LOCAL
 fi
-chown www-data:ansible "$INVENTORY"
+chown ansible:ansible "$INVENTORY"
 chmod 664 "$INVENTORY"
 DBSCRIPT
 ok "Database imported, admin user set, init.php rendered"
@@ -620,7 +647,7 @@ ok "Database imported, admin user set, init.php rendered"
 pct exec "$CTID" -- systemctl restart apache2 >/dev/null 2>&1 || true
 
 CT_IP=$(pct exec "$CTID" -- bash -c "hostname -I | awk '{print \$1}'" 2>/dev/null | tr -d '[:space:]')
-SSH_PUBKEY=$(pct exec "$CTID" -- cat /var/www/.ssh/id_ed25519.pub 2>/dev/null || echo "<failed-to-read>")
+SSH_PUBKEY=$(pct exec "$CTID" -- cat /home/ansible/.ssh/id_ed25519.pub 2>/dev/null || echo "<failed-to-read>")
 
 echo ""
 echo -e "${BOLD}${GREEN}========================================${NC}"
