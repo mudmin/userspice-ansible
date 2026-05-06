@@ -501,6 +501,14 @@ find '/var/www/html/${REPO_DIR_NAME}/playbooks' -name '*.py' -exec chmod 775 {} 
 mkdir -p '/var/www/html/${REPO_DIR_NAME}/ansible/runs'
 chown www-data:ansible '/var/www/html/${REPO_DIR_NAME}/ansible/runs'
 chmod 2775 '/var/www/html/${REPO_DIR_NAME}/ansible/runs'
+
+# helper.php hardcodes http://127.0.0.1/ansible/parsers/run_finish.php as
+# the run-finish callback URL. With our DocumentRoot at /var/www/html and
+# the app under /userspice-ansible/, that path 404s — runs would never
+# get finished_at stamped and the UI would poll forever. Symlink the
+# expected path to where the files actually live.
+ln -sfn '/var/www/html/${REPO_DIR_NAME}/ansible' /var/www/html/ansible
+chown -h www-data:www-data /var/www/html/ansible
 "; then
     cleanup_on_fail
     fail "Clone failed."
