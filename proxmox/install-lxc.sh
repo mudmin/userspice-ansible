@@ -390,6 +390,54 @@ exit;
 INDEXPHP
 chown www-data:www-data /var/www/html/index.php
 
+# Wrapper so users can just type `add-server` instead of remembering the
+# `sudo -u www-data /var/www/html/.../add_server.sh` invocation. We re-exec
+# as www-data because add_server.sh uses $HOME/.ssh/id_ed25519, and the web
+# UI runs as www-data — both must use the same key.
+cat > /usr/local/bin/add-server <<'WRAPPER'
+#!/bin/bash
+# Onboard a new host into the Ansible fleet (interactive wizard).
+# Runs add_server.sh as www-data so SSH keys match what the web UI uses.
+exec sudo -u www-data --preserve-env=DEBUG \
+    /var/www/html/userspice-ansible/playbooks/add_server.sh "$@"
+WRAPPER
+chmod +x /usr/local/bin/add-server
+
+# Login banner — shown on every SSH login via /etc/update-motd.d/.
+# Quiet down Ubuntu's noisy default MOTD ads while we're here.
+[[ -f /etc/default/motd-news ]] && sed -i 's/^ENABLED=1/ENABLED=0/' /etc/default/motd-news
+
+cat > /etc/update-motd.d/99-userspice-ansible <<'MOTDSCRIPT'
+#!/bin/bash
+IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+cat <<EOF
+
+==============================================================
+  UserSpice Ansible
+==============================================================
+
+  Web UI:        http://${IP}/
+  phpMyAdmin:    http://${IP}/phpmyadmin/
+
+  Add a server (interactive wizard):
+      add-server
+
+  Ping all hosts in your inventory:
+      sudo -u www-data ansible \\
+          -i /var/www/html/userspice-ansible/playbooks/inventory.ini \\
+          all -m ping
+
+  Playbook directory:
+      /var/www/html/userspice-ansible/playbooks/
+
+  Customization guide:
+      /var/www/html/userspice-ansible/AGENT_GUIDE.md
+
+==============================================================
+EOF
+MOTDSCRIPT
+chmod +x /etc/update-motd.d/99-userspice-ansible
+
 systemctl restart apache2
 CONTAINER_SCRIPT
 
@@ -537,12 +585,16 @@ echo -e "  ${BOLD}SSH public key for fleet access${NC} (copy this to each manage
 echo "    ${SSH_PUBKEY}"
 echo ""
 echo -e "  ${BOLD}Next steps:${NC}"
-echo "    1. Edit /var/www/html/userspice-ansible/playbooks/inventory.ini and add your hosts."
-echo "    2. Add the public key above to ~/.ssh/authorized_keys on each fleet host."
-echo "       (Or from the LXC: sudo -u www-data ssh-copy-id -i /var/www/.ssh/id_ed25519.pub user@host)"
-echo "    3. Test connectivity:"
-echo "         pct exec ${CTID} -- sudo -u www-data ansible -i /var/www/html/userspice-ansible/playbooks/inventory.ini all -m ping"
-echo "    4. Log in to the web UI and run a playbook."
+echo "    1. SSH into the LXC. The login banner repeats these instructions —"
+echo "       no need to memorize anything."
+echo "         ssh root@${CT_IP:-<ip>}"
+echo ""
+echo "    2. Onboard your fleet hosts with the interactive wizard. It handles"
+echo "       SSH keys, sudo passwords, vault encryption, and inventory grouping:"
+echo "         add-server"
+echo ""
+echo -e "    3. Visit ${BOLD}http://${CT_IP:-<ip>}/${NC} and log in with the admin"
+echo "       credentials above. Click any playbook to run it."
 echo ""
 echo -e "  ${BOLD}Customization guide:${NC} /var/www/html/userspice-ansible/AGENT_GUIDE.md"
 echo "                            (also viewable in the repo on GitHub)"
