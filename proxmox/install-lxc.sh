@@ -382,15 +382,22 @@ done
 # user that actually runs ansible-playbook (via sudo from www-data). Keep
 # it at /home/ansible/.ssh/id_ed25519 so ansible_ssh_private_key_file=
 # ~/.ssh/id_ed25519 in the inventory resolves correctly.
-mkdir -p /home/ansible/.ssh
-chmod 700 /home/ansible/.ssh
-if [[ ! -f /home/ansible/.ssh/id_ed25519 ]]; then
-    sudo -u ansible ssh-keygen -t ed25519 -f /home/ansible/.ssh/id_ed25519 -N "" -C "userspice-ansible@$(hostname)"
-fi
-touch /home/ansible/.ssh/known_hosts
-chown -R ansible:ansible /home/ansible/.ssh
-chmod 644 /home/ansible/.ssh/known_hosts /home/ansible/.ssh/id_ed25519.pub
-chmod 600 /home/ansible/.ssh/id_ed25519
+#
+# Do the whole setup as the ansible user so .ssh and its contents are
+# created with the right ownership from the start (avoids a chicken-and-egg
+# where root-owned ~/.ssh blocks ssh-keygen running as ansible).
+HN=$(hostname)
+sudo -u ansible bash -c "
+    set -e
+    mkdir -p /home/ansible/.ssh
+    chmod 700 /home/ansible/.ssh
+    if [[ ! -f /home/ansible/.ssh/id_ed25519 ]]; then
+        ssh-keygen -t ed25519 -f /home/ansible/.ssh/id_ed25519 -N '' -C 'userspice-ansible@$HN'
+    fi
+    touch /home/ansible/.ssh/known_hosts
+    chmod 644 /home/ansible/.ssh/known_hosts /home/ansible/.ssh/id_ed25519.pub
+    chmod 600 /home/ansible/.ssh/id_ed25519
+"
 
 # Optional: restrict all web access to a single IP via Apache Require.
 if [[ -n "$RESTRICT_IP" ]]; then
