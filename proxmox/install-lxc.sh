@@ -146,6 +146,11 @@ done
 COOKIE_NAME="$(gen_token)"
 SESSION_NAME="$(gen_token)"
 
+# Vault password — encrypts host_vars/*.yml on every `add-server` invocation.
+# Generated once at install; user must back this up because losing it means
+# every encrypted host_vars file becomes unreadable forever.
+VAULT_PW="$(openssl rand -base64 32 | tr -d '\n')"
+
 # ---- Container resource prompts ----
 echo ""
 echo -e "${BOLD}Container resources${NC}"
@@ -287,6 +292,7 @@ INSTALL_RC=0
 pct exec "$CTID" -- env \
     MYSQL_PW="$MYSQL_PW" \
     RESTRICT_IP="$RESTRICT_IP" \
+    VAULT_PW="$VAULT_PW" \
     bash <<'CONTAINER_SCRIPT' || INSTALL_RC=$?
 set -e
 export DEBIAN_FRONTEND=noninteractive
@@ -398,6 +404,15 @@ sudo -u ansible bash -c "
     chmod 644 /home/ansible/.ssh/known_hosts /home/ansible/.ssh/id_ed25519.pub
     chmod 600 /home/ansible/.ssh/id_ed25519
 "
+
+# Vault password file — written as root (avoids the password ever appearing
+# in process argv), then chowned to ansible. ansible.cfg's vault_password_file
+# line points at this path so ansible-vault auto-uses it.
+mkdir -p /home/ansible/.ansible
+echo "$VAULT_PW" > /home/ansible/.ansible/vault_pass.txt
+chown -R ansible:ansible /home/ansible/.ansible
+chmod 700 /home/ansible/.ansible
+chmod 600 /home/ansible/.ansible/vault_pass.txt
 
 # Optional: restrict all web access to a single IP via Apache Require.
 if [[ -n "$RESTRICT_IP" ]]; then
@@ -696,6 +711,17 @@ echo -e "  LXC root:       ${BOLD}${ROOT_PW}${NC}   (${ROOT_PW_LABEL})"
 echo -e "  MariaDB root:   ${BOLD}${MYSQL_PW}${NC}   (${MYSQL_PW_LABEL})"
 echo -e "  Admin email:    ${BOLD}${ADMIN_EMAIL}${NC}"
 echo -e "  Admin password: ${BOLD}${ADMIN_PW}${NC}   (${ADMIN_PW_LABEL})"
+echo -e "  Vault password: ${BOLD}${VAULT_PW}${NC}"
+echo ""
+echo -e "${RED}${BOLD}=================================================================${NC}"
+echo -e "${RED}${BOLD}  *** BACK UP THE VAULT PASSWORD ***${NC}"
+echo -e "${RED}${BOLD}=================================================================${NC}"
+echo -e "  ${YELLOW}It encrypts every host_vars/*.yml file you create with${NC}"
+echo -e "  ${YELLOW}add-server (sudo passwords, per-host secrets).${NC}"
+echo -e "  ${YELLOW}Without it, those files cannot be decrypted. There is no${NC}"
+echo -e "  ${YELLOW}recovery — losing it bricks every host you have onboarded.${NC}"
+echo -e "  ${YELLOW}Stored on the LXC at: /home/ansible/.ansible/vault_pass.txt${NC}"
+echo -e "${RED}${BOLD}=================================================================${NC}"
 echo ""
 echo -e "  Web UI:      ${BOLD}http://${CT_IP:-<ip>}/${NC}"
 echo -e "  phpMyAdmin:  ${BOLD}http://${CT_IP:-<ip>}/phpmyadmin/${NC}   (root / MariaDB password)"
