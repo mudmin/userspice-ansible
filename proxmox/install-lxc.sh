@@ -23,6 +23,11 @@ REPO_DIR_NAME="userspice-ansible"
 APP_NAME="UserSpice Ansible"
 DB_NAME="ansible-ui"
 
+# Pin clone to the matching release tag. If the tag is missing on origin
+# (rare — usually a fresh installer pulled from main before tags push),
+# the clone falls back to main with a warning.
+INSTALLER_VERSION="0.2.0"
+
 DEFAULT_HOSTNAME="userspice-ansible"
 DEFAULT_DISK="8"        # GB — LAMP + ansible needs ~3GB
 DEFAULT_CORES="2"
@@ -131,7 +136,7 @@ while true; do
 done
 
 while true; do
-    ask "Restrict web access to a single IP? Enter IP, or leave blank for unrestricted:"
+    ask "Restrict access to a single IP (web + SSH via ufw)? Enter IP, or leave blank for unrestricted:"
     read -r RESTRICT_IP
     if [[ -z "$RESTRICT_IP" ]]; then
         break
@@ -141,6 +146,13 @@ while true; do
     fi
     warn "\"$RESTRICT_IP\" does not look like an IP address — try again or leave blank for unrestricted"
 done
+
+ask "Install phpMyAdmin? (recommended for development only) [y/N]:"
+read -r INSTALL_PMA_ANSWER
+INSTALL_PMA=0
+if [[ "${INSTALL_PMA_ANSWER,,}" == "y" || "${INSTALL_PMA_ANSWER,,}" == "yes" ]]; then
+    INSTALL_PMA=1
+fi
 
 # Generate cookie/session names now so they're consistent across the install
 COOKIE_NAME="$(gen_token)"
@@ -203,7 +215,8 @@ echo "  Disk:            ${DISK} GB on ${CT_STORAGE}"
 echo "  CPU / RAM:       ${CORES} cores / ${RAM} MB"
 echo "  Bridge:          ${BRIDGE}"
 echo "  Admin email:     ${ADMIN_EMAIL}"
-echo "  Web IP lock:     ${RESTRICT_IP:-<none — unrestricted>}"
+echo "  IP lock (web+SSH): ${RESTRICT_IP:-<none — unrestricted>}"
+echo "  phpMyAdmin:      $([[ $INSTALL_PMA -eq 1 ]] && echo "yes" || echo "no")"
 echo ""
 ask "Proceed? [Y/n]:"
 read -r CONFIRM
@@ -293,6 +306,7 @@ pct exec "$CTID" -- env \
     MYSQL_PW="$MYSQL_PW" \
     RESTRICT_IP="$RESTRICT_IP" \
     VAULT_PW="$VAULT_PW" \
+    INSTALL_PMA="$INSTALL_PMA" \
     bash <<'CONTAINER_SCRIPT' || INSTALL_RC=$?
 set -e
 export DEBIAN_FRONTEND=noninteractive
@@ -358,15 +372,18 @@ password=$MYSQL_PW
 CNF
 chmod 600 /root/.my.cnf
 
-# phpMyAdmin (non-interactive via debconf)
-debconf-set-selections <<DEBCONF
+# phpMyAdmin (optional — recommended for development only). When opted in,
+# debconf preseeds the passwords so the install is non-interactive.
+if [[ "$INSTALL_PMA" == "1" ]]; then
+    debconf-set-selections <<DEBCONF
 phpmyadmin phpmyadmin/dbconfig-install boolean true
 phpmyadmin phpmyadmin/app-password-confirm password $MYSQL_PW
 phpmyadmin phpmyadmin/mysql/admin-pass password $MYSQL_PW
 phpmyadmin phpmyadmin/mysql/app-pass password $MYSQL_PW
 phpmyadmin phpmyadmin/reconfigure-webserver multiselect apache2
 DEBCONF
-apt-get install -yq phpmyadmin
+    apt-get install -yq phpmyadmin
+fi
 
 # PHP tuning for long ansible runs and UserSpice form posts
 PHP_VER=$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')
@@ -414,14 +431,42 @@ chown -R ansible:ansible /home/ansible/.ansible
 chmod 700 /home/ansible/.ansible
 chmod 600 /home/ansible/.ansible/vault_pass.txt
 
-# Optional: restrict all web access to a single IP via Apache Require.
+# Optional: restrict all access to a single IP. Two layers in concert:
+#   1. Apache Require ip on the app's filesystem path (and on phpMyAdmin's
+#      separate path when it's installed) — defense in depth at the HTTP layer.
+#   2. ufw rules — the real boundary. Locks ports 22 / 80 / 443 to the operator
+#      IP at the network layer, which is what actually keeps SSH and
+#      phpMyAdmin contained.
 if [[ -n "$RESTRICT_IP" ]]; then
     cat > /etc/apache2/conf-available/99-userspice-ansible-restrict.conf <<APACHERESTRICT
 <Directory /var/www/html>
     Require ip $RESTRICT_IP
 </Directory>
 APACHERESTRICT
+
+    # phpMyAdmin's Apache alias points at /usr/share/phpmyadmin, outside the
+    # /var/www/html scope above. Add a parallel Require ip block so it stays
+    # restricted even if someone hits its URL via 127.0.0.1 or hostname tricks.
+    if [[ -d /usr/share/phpmyadmin ]]; then
+        cat >> /etc/apache2/conf-available/99-userspice-ansible-restrict.conf <<APACHEPMA
+<Directory /usr/share/phpmyadmin>
+    Require ip $RESTRICT_IP
+</Directory>
+APACHEPMA
+    fi
     a2enconf 99-userspice-ansible-restrict >/dev/null 2>&1 || true
+
+    apt-get install -yq ufw
+    ufw default deny incoming >/dev/null
+    ufw default allow outgoing >/dev/null
+    ufw allow from "$RESTRICT_IP" to any port 22 proto tcp >/dev/null
+    ufw allow from "$RESTRICT_IP" to any port 80 proto tcp >/dev/null
+    ufw allow from "$RESTRICT_IP" to any port 443 proto tcp >/dev/null
+    if ! ufw --force enable >/dev/null 2>&1; then
+        echo "WARNING: ufw enable failed inside the LXC. Apache Require ip is" >&2
+        echo "still active for HTTP/HTTPS, but SSH is NOT firewalled. Lock SSH" >&2
+        echo "manually (Proxmox firewall on the bridge, or sshd ListenAddress)." >&2
+    fi
 fi
 
 # Apache DocumentRoot points directly at the app (set below in the apache
@@ -458,7 +503,15 @@ cat <<EOF
 ==============================================================
 
   Web UI:        http://${IP}/
-  phpMyAdmin:    http://${IP}/phpmyadmin/
+EOF
+
+# phpMyAdmin is optional — only show its URL when it's actually installed.
+# Self-detects so the MOTD stays correct if it's added or removed later.
+if [[ -d /usr/share/phpmyadmin ]]; then
+    echo "  phpMyAdmin:    http://${IP}/phpmyadmin/"
+fi
+
+cat <<EOF
 
   Add a server (interactive wizard):
       add-server
@@ -494,7 +547,13 @@ step "Cloning ${REPO_DIR_NAME} repo"
 if ! pct exec "$CTID" -- bash -c "
 set -e
 cd /var/www/html
-git clone '$REPO_URL' '$REPO_DIR_NAME'
+# Pin to the matching release tag. Falls back to main if the tag isn't
+# pushed yet (a dev-time race where the installer reaches GitHub before
+# the tag does); operators see a clear warning when that happens.
+if ! git clone --branch 'v$INSTALLER_VERSION' --depth 1 '$REPO_URL' '$REPO_DIR_NAME' 2>/dev/null; then
+    echo 'WARNING: tag v$INSTALLER_VERSION not found on origin, falling back to main' >&2
+    git clone --depth 1 '$REPO_URL' '$REPO_DIR_NAME'
+fi
 
 # Ownership model:
 #   - Web UI files (PHP, users/, usersc/, ansible/): www-data:www-data
@@ -555,20 +614,41 @@ chmod 640 config.php
 COMPOSERSCRIPT
 ok "Composer dependencies installed, ansible/config.php rendered"
 
-# ---- Apache: DocumentRoot, mod_rewrite, AllowOverride, playbook deny ----
-step "Configuring Apache (DocumentRoot + mod_rewrite + AllowOverride + deny)"
+# ---- Apache: TLS, DocumentRoot, mod_rewrite, AllowOverride, playbook deny ----
+step "Configuring Apache (HTTPS + DocumentRoot + mod_rewrite + deny)"
 pct exec "$CTID" -- bash <<'APACHECONFIG'
 set -e
 
 # UserSpice ships .htaccess files with rewrite rules — both must be on.
 a2enmod rewrite >/dev/null 2>&1
+a2enmod ssl >/dev/null 2>&1
 
-# Point DocumentRoot at the app directly. UserSpice expects to live at the
-# webroot (its init.php walks up from PHP_SELF looking for z_us_root.php
-# in DOCUMENT_ROOT). With DocumentRoot=/var/www/html the wrapper-callback
-# URL /ansible/parsers/run_finish.php 500s because UserSpice's path
-# detection fails. With DocumentRoot=/var/www/html/userspice-ansible
-# everything lines up.
+# Generate a self-signed cert at install. Browsers warn on first visit
+# (no chain of trust) — acceptable for an internal appliance. CN = LXC
+# hostname; SAN omitted because the IP isn't reliably known here. To
+# replace with a real cert (Tailscale serve, Let's Encrypt), see
+# HARDENING.md — the vhost references these two paths so a swap is just
+# overwriting the files.
+HOSTNAME_CN=$(hostname)
+mkdir -p /etc/ssl/private
+if [[ ! -f /etc/ssl/certs/userspice-ansible.crt ]]; then
+    openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
+        -keyout /etc/ssl/private/userspice-ansible.key \
+        -out /etc/ssl/certs/userspice-ansible.crt \
+        -subj "/CN=${HOSTNAME_CN}" 2>/dev/null
+fi
+chmod 600 /etc/ssl/private/userspice-ansible.key
+chmod 644 /etc/ssl/certs/userspice-ansible.crt
+
+# Port 80 = redirect EXTERNAL traffic to HTTPS, preserving Host + path.
+# Loopback stays on plain HTTP so the run-wrapper callback works:
+# helper.php hardcodes http://127.0.0.1/ansible/parsers/run_finish.php
+# and run_wrapper.sh's curl has no -L/-k. Exempting 127.0.0.1 / ::1 from
+# the redirect keeps that flow simple. Don't enable UserSpice's
+# `force_ssl` setting in the admin UI — its PHP-level redirect would
+# fire on the loopback request and break this. Apache handles HTTPS
+# enforcement for external traffic; UserSpice's setting is redundant
+# here and actively harmful.
 cat > /etc/apache2/sites-available/000-default.conf <<'VHOST'
 <VirtualHost *:80>
     ServerAdmin webmaster@localhost
@@ -580,13 +660,44 @@ cat > /etc/apache2/sites-available/000-default.conf <<'VHOST'
         Require all granted
     </Directory>
 
+    RewriteEngine On
+    RewriteCond %{REMOTE_ADDR} !^127\.0\.0\.1$
+    RewriteCond %{REMOTE_ADDR} !^::1$
+    RewriteRule ^(.*)$ https://%{HTTP_HOST}$1 [R=301,L]
+
     ErrorLog ${APACHE_LOG_DIR}/error.log
     CustomLog ${APACHE_LOG_DIR}/access.log combined
 </VirtualHost>
 VHOST
 
+# Port 443 = real app vhost. UserSpice expects to live at the webroot
+# (its init.php walks up from PHP_SELF looking for z_us_root.php in
+# DOCUMENT_ROOT). With DocumentRoot=/var/www/html the wrapper-callback
+# URL /ansible/parsers/run_finish.php 500s. This DocumentRoot lines up.
+cat > /etc/apache2/sites-available/default-ssl.conf <<'VHOST_SSL'
+<VirtualHost *:443>
+    ServerAdmin webmaster@localhost
+    DocumentRoot /var/www/html/userspice-ansible
+
+    SSLEngine on
+    SSLCertificateFile /etc/ssl/certs/userspice-ansible.crt
+    SSLCertificateKeyFile /etc/ssl/private/userspice-ansible.key
+
+    <Directory /var/www/html/userspice-ansible>
+        Options Indexes FollowSymLinks
+        AllowOverride All
+        Require all granted
+    </Directory>
+
+    ErrorLog ${APACHE_LOG_DIR}/error-ssl.log
+    CustomLog ${APACHE_LOG_DIR}/access-ssl.log combined
+</VirtualHost>
+VHOST_SSL
+a2ensite default-ssl >/dev/null 2>&1
+
 # Block direct HTTP access to the playbooks tree, db schema, and installer.
-# PHP exec still reads playbooks fine — only HTTP serving is denied.
+# Filesystem-scoped so it covers both vhosts. PHP exec still reads
+# playbooks fine — only HTTP serving is denied.
 cat > /etc/apache2/conf-available/99-userspice-ansible-app.conf <<'CONF'
 <Directory /var/www/html/userspice-ansible/playbooks>
     Require all denied
@@ -602,7 +713,7 @@ a2enconf 99-userspice-ansible-app >/dev/null 2>&1 || true
 apache2ctl configtest >/dev/null
 systemctl reload apache2
 APACHECONFIG
-ok "DocumentRoot=/var/www/html/userspice-ansible; mod_rewrite + AllowOverride on; playbooks/db/proxmox denied"
+ok "HTTPS on (self-signed); 80 redirects to 443; playbooks/db/proxmox denied"
 
 # ---- Database setup, schema import, admin user, init.php render ----
 step "Setting up database, importing schema, configuring admin user"
@@ -723,14 +834,26 @@ echo -e "  ${YELLOW}recovery — losing it bricks every host you have onboarded.
 echo -e "  ${YELLOW}Stored on the LXC at: /home/ansible/.ansible/vault_pass.txt${NC}"
 echo -e "${RED}${BOLD}=================================================================${NC}"
 echo ""
-echo -e "  Web UI:      ${BOLD}http://${CT_IP:-<ip>}/${NC}"
-echo -e "  phpMyAdmin:  ${BOLD}http://${CT_IP:-<ip>}/phpmyadmin/${NC}   (root / MariaDB password)"
+echo -e "  Web UI:      ${BOLD}https://${CT_IP:-<ip>}/${NC}"
+if [[ $INSTALL_PMA -eq 1 ]]; then
+    echo -e "  phpMyAdmin:  ${BOLD}https://${CT_IP:-<ip>}/phpmyadmin/${NC}   (root / MariaDB password)"
+fi
 echo -e "  SSH:         ${BOLD}ssh root@${CT_IP:-<ip>}${NC}"
 echo -e "  Console:     ${BOLD}pct enter ${CTID}${NC}"
+echo ""
+echo -e "  ${YELLOW}HTTPS uses a self-signed cert — your browser will warn on first${NC}"
+echo -e "  ${YELLOW}visit. Click through; it's expected. See HARDENING.md to swap${NC}"
+echo -e "  ${YELLOW}in a real cert (Tailscale serve, Let's Encrypt, your own).${NC}"
 if [[ -n "$RESTRICT_IP" ]]; then
     echo ""
-    echo -e "  ${YELLOW}Web access is restricted to IP: ${BOLD}${RESTRICT_IP}${NC}"
-    echo -e "  ${YELLOW}Edit /etc/apache2/conf-available/99-userspice-ansible-restrict.conf to change.${NC}"
+    echo -e "  ${YELLOW}Access (web + SSH) restricted to IP: ${BOLD}${RESTRICT_IP}${NC}"
+    echo -e "  ${YELLOW}ufw is active with allow rules for ports 22, 80, 443 from that IP.${NC}"
+    echo -e "  ${YELLOW}To add another operator IP: see HARDENING.md.${NC}"
+else
+    echo ""
+    echo -e "  ${YELLOW}No IP restriction set — anyone on the bridge network can reach${NC}"
+    echo -e "  ${YELLOW}this LXC's web UI and SSH. Lock it down via the installer's${NC}"
+    echo -e "  ${YELLOW}\"Restrict access\" prompt or with ufw. See HARDENING.md.${NC}"
 fi
 echo ""
 echo -e "  ${BOLD}SSH public key for fleet access${NC} (copy this to each managed host):"
