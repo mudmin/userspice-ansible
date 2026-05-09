@@ -26,7 +26,7 @@ DB_NAME="ansible-ui"
 # Pin clone to the matching release tag. If the tag is missing on origin
 # (rare — usually a fresh installer pulled from main before tags push),
 # the clone falls back to main with a warning.
-INSTALLER_VERSION="0.2.0"
+INSTALLER_VERSION="0.2.1"
 
 DEFAULT_HOSTNAME="userspice-ansible"
 DEFAULT_DISK="8"        # GB — LAMP + ansible needs ~3GB
@@ -614,41 +614,24 @@ chmod 640 config.php
 COMPOSERSCRIPT
 ok "Composer dependencies installed, ansible/config.php rendered"
 
-# ---- Apache: TLS, DocumentRoot, mod_rewrite, AllowOverride, playbook deny ----
-step "Configuring Apache (HTTPS + DocumentRoot + mod_rewrite + deny)"
+# ---- Apache: DocumentRoot, mod_rewrite, AllowOverride, playbook deny ----
+# Plain HTTP only by default — for an internal appliance reached over
+# LAN/Tailscale/VPN, self-signed HTTPS adds a permanent "Not Secure"
+# warning that trains users to ignore browser warnings without actually
+# protecting against a same-network attacker. Operators who want HTTPS
+# get a real path in HARDENING.md (Tailscale serve / Let's Encrypt / BYO);
+# none of those benefit from install-time self-signed scaffolding.
+step "Configuring Apache (DocumentRoot + mod_rewrite + AllowOverride + deny)"
 pct exec "$CTID" -- bash <<'APACHECONFIG'
 set -e
 
 # UserSpice ships .htaccess files with rewrite rules — both must be on.
 a2enmod rewrite >/dev/null 2>&1
-a2enmod ssl >/dev/null 2>&1
 
-# Generate a self-signed cert at install. Browsers warn on first visit
-# (no chain of trust) — acceptable for an internal appliance. CN = LXC
-# hostname; SAN omitted because the IP isn't reliably known here. To
-# replace with a real cert (Tailscale serve, Let's Encrypt), see
-# HARDENING.md — the vhost references these two paths so a swap is just
-# overwriting the files.
-HOSTNAME_CN=$(hostname)
-mkdir -p /etc/ssl/private
-if [[ ! -f /etc/ssl/certs/userspice-ansible.crt ]]; then
-    openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
-        -keyout /etc/ssl/private/userspice-ansible.key \
-        -out /etc/ssl/certs/userspice-ansible.crt \
-        -subj "/CN=${HOSTNAME_CN}" 2>/dev/null
-fi
-chmod 600 /etc/ssl/private/userspice-ansible.key
-chmod 644 /etc/ssl/certs/userspice-ansible.crt
-
-# Port 80 = redirect EXTERNAL traffic to HTTPS, preserving Host + path.
-# Loopback stays on plain HTTP so the run-wrapper callback works:
-# helper.php hardcodes http://127.0.0.1/ansible/parsers/run_finish.php
-# and run_wrapper.sh's curl has no -L/-k. Exempting 127.0.0.1 / ::1 from
-# the redirect keeps that flow simple. Don't enable UserSpice's
-# `force_ssl` setting in the admin UI — its PHP-level redirect would
-# fire on the loopback request and break this. Apache handles HTTPS
-# enforcement for external traffic; UserSpice's setting is redundant
-# here and actively harmful.
+# Point DocumentRoot at the app directly. UserSpice expects to live at the
+# webroot (its init.php walks up from PHP_SELF looking for z_us_root.php
+# in DOCUMENT_ROOT). With DocumentRoot=/var/www/html the wrapper-callback
+# URL /ansible/parsers/run_finish.php 500s. This DocumentRoot lines up.
 cat > /etc/apache2/sites-available/000-default.conf <<'VHOST'
 <VirtualHost *:80>
     ServerAdmin webmaster@localhost
@@ -660,44 +643,13 @@ cat > /etc/apache2/sites-available/000-default.conf <<'VHOST'
         Require all granted
     </Directory>
 
-    RewriteEngine On
-    RewriteCond %{REMOTE_ADDR} !^127\.0\.0\.1$
-    RewriteCond %{REMOTE_ADDR} !^::1$
-    RewriteRule ^(.*)$ https://%{HTTP_HOST}$1 [R=301,L]
-
     ErrorLog ${APACHE_LOG_DIR}/error.log
     CustomLog ${APACHE_LOG_DIR}/access.log combined
 </VirtualHost>
 VHOST
 
-# Port 443 = real app vhost. UserSpice expects to live at the webroot
-# (its init.php walks up from PHP_SELF looking for z_us_root.php in
-# DOCUMENT_ROOT). With DocumentRoot=/var/www/html the wrapper-callback
-# URL /ansible/parsers/run_finish.php 500s. This DocumentRoot lines up.
-cat > /etc/apache2/sites-available/default-ssl.conf <<'VHOST_SSL'
-<VirtualHost *:443>
-    ServerAdmin webmaster@localhost
-    DocumentRoot /var/www/html/userspice-ansible
-
-    SSLEngine on
-    SSLCertificateFile /etc/ssl/certs/userspice-ansible.crt
-    SSLCertificateKeyFile /etc/ssl/private/userspice-ansible.key
-
-    <Directory /var/www/html/userspice-ansible>
-        Options Indexes FollowSymLinks
-        AllowOverride All
-        Require all granted
-    </Directory>
-
-    ErrorLog ${APACHE_LOG_DIR}/error-ssl.log
-    CustomLog ${APACHE_LOG_DIR}/access-ssl.log combined
-</VirtualHost>
-VHOST_SSL
-a2ensite default-ssl >/dev/null 2>&1
-
 # Block direct HTTP access to the playbooks tree, db schema, and installer.
-# Filesystem-scoped so it covers both vhosts. PHP exec still reads
-# playbooks fine — only HTTP serving is denied.
+# PHP exec still reads playbooks fine — only HTTP serving is denied.
 cat > /etc/apache2/conf-available/99-userspice-ansible-app.conf <<'CONF'
 <Directory /var/www/html/userspice-ansible/playbooks>
     Require all denied
@@ -713,7 +665,7 @@ a2enconf 99-userspice-ansible-app >/dev/null 2>&1 || true
 apache2ctl configtest >/dev/null
 systemctl reload apache2
 APACHECONFIG
-ok "HTTPS on (self-signed); 80 redirects to 443; playbooks/db/proxmox denied"
+ok "DocumentRoot=/var/www/html/userspice-ansible; mod_rewrite + AllowOverride on; playbooks/db/proxmox denied"
 
 # ---- Database setup, schema import, admin user, init.php render ----
 step "Setting up database, importing schema, configuring admin user"
@@ -834,16 +786,17 @@ echo -e "  ${YELLOW}recovery — losing it bricks every host you have onboarded.
 echo -e "  ${YELLOW}Stored on the LXC at: /home/ansible/.ansible/vault_pass.txt${NC}"
 echo -e "${RED}${BOLD}=================================================================${NC}"
 echo ""
-echo -e "  Web UI:      ${BOLD}https://${CT_IP:-<ip>}/${NC}"
+echo -e "  Web UI:      ${BOLD}http://${CT_IP:-<ip>}/${NC}"
 if [[ $INSTALL_PMA -eq 1 ]]; then
-    echo -e "  phpMyAdmin:  ${BOLD}https://${CT_IP:-<ip>}/phpmyadmin/${NC}   (root / MariaDB password)"
+    echo -e "  phpMyAdmin:  ${BOLD}http://${CT_IP:-<ip>}/phpmyadmin/${NC}   (root / MariaDB password)"
 fi
 echo -e "  SSH:         ${BOLD}ssh root@${CT_IP:-<ip>}${NC}"
 echo -e "  Console:     ${BOLD}pct enter ${CTID}${NC}"
 echo ""
-echo -e "  ${YELLOW}HTTPS uses a self-signed cert — your browser will warn on first${NC}"
-echo -e "  ${YELLOW}visit. Click through; it's expected. See HARDENING.md to swap${NC}"
-echo -e "  ${YELLOW}in a real cert (Tailscale serve, Let's Encrypt, your own).${NC}"
+echo -e "  ${YELLOW}Web UI is plain HTTP. For an isolated LXC reached over LAN,${NC}"
+echo -e "  ${YELLOW}Tailscale, or VPN, that's deliberate. To enable HTTPS with${NC}"
+echo -e "  ${YELLOW}a real cert (Tailscale serve / Let's Encrypt / BYO): see${NC}"
+echo -e "  ${YELLOW}HARDENING.md. ufw already allows 443 from the operator IP.${NC}"
 if [[ -n "$RESTRICT_IP" ]]; then
     echo ""
     echo -e "  ${YELLOW}Access (web + SSH) restricted to IP: ${BOLD}${RESTRICT_IP}${NC}"

@@ -45,10 +45,10 @@ source. Skipping it leaves the LXC reachable from anywhere on its network.
 ## After install
 
 1. Open the UI at the URL printed by the installer and log in with the
-   admin credentials you set during install. The installer ships a
-   self-signed certificate, so your browser will warn on first visit —
-   click through. See [HARDENING.md](HARDENING.md) to swap in a real
-   cert (Tailscale serve, Let's Encrypt, or your own).
+   admin credentials you set during install. The installer ships plain
+   HTTP — appropriate for an internal LXC reached over LAN, Tailscale,
+   or VPN. To enable HTTPS with a real cert, see
+   [HARDENING.md](HARDENING.md).
 2. Run `add-server` on the LXC console to onboard your fleet hosts. The
    wizard handles SSH keys, sudo passwords, vault encryption, and
    inventory grouping.

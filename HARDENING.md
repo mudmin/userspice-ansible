@@ -6,32 +6,31 @@ for operators who want to deviate from those defaults. Read
 [README.md](README.md) first; the threat model section explains *why*
 the defaults are what they are.
 
-## Replace the self-signed certificate
+## Enable HTTPS
 
-The installer generates `/etc/ssl/certs/userspice-ansible.crt` (10-year
-self-signed, `CN = <lxc-hostname>`). Browsers warn on first visit. Three
-ways to replace it.
+The installer ships **plain HTTP**. For an internal LXC reached over
+LAN, Tailscale, or VPN that's deliberate: a self-signed cert produces a
+permanent "Not Secure" warning that trains operators to ignore browser
+warnings without protecting against a same-network attacker. Operators
+who want real HTTPS have three good paths — pick the one that matches
+your network model.
+
+ufw already permits port 443 from the operator IP, so no firewall edit
+is needed for any of these.
 
 ### Option A — Tailscale serve (recommended if you're on a tailnet)
 
 `tailscale serve` issues and renews a real cert via Tailscale's CA. Any
-operator already trusting Tailscale's CA sees no warning.
+operator with Tailscale installed sees a clean padlock — no warning.
+This is by far the lowest-friction path for the typical deployment.
 
 ```sh
 # Inside the LXC, after `tailscale up`:
 sudo tailscale serve --bg https / http://localhost:80
 ```
 
-That terminates TLS in tailscaled and proxies to Apache on 80. With
-that in place, you can disable our 80→443 redirect so Apache serves
-plain HTTP on the loopback:
-
-```sh
-# /etc/apache2/sites-available/000-default.conf — replace the rewrite
-# block with a normal vhost (DocumentRoot, Directory, etc.) and:
-sudo a2dissite default-ssl
-sudo systemctl reload apache2
-```
+tailscaled terminates TLS on the tailnet IP and proxies to Apache on
+loopback:80. The Apache vhost stays as-is.
 
 ### Option B — Let's Encrypt (real domain, port 80 reachable)
 
@@ -43,19 +42,45 @@ sudo apt install certbot python3-certbot-apache
 sudo certbot --apache -d ansible.example.com
 ```
 
-certbot rewrites the Apache vhosts and sets up auto-renewal.
+certbot adds an SSL vhost on 443, sets up auto-renewal, and (by default)
+adds a redirect from 80 to 443. If you want to keep loopback traffic on
+plain HTTP — required because helper.php's run-finish callback hits
+`http://127.0.0.1/...` and run_wrapper.sh's curl doesn't follow
+redirects — answer "No redirect" when certbot asks, or edit the
+generated 80 vhost to add a `RewriteCond %{REMOTE_ADDR} !^127\.0\.0\.1$`
+guard.
 
 ### Option C — Bring your own cert
 
-Drop in your cert + key:
+Enable mod_ssl, drop your cert + key in place, and write a 443 vhost:
 
-```
-/etc/ssl/certs/userspice-ansible.crt
-/etc/ssl/private/userspice-ansible.key
+```sh
+sudo a2enmod ssl
 ```
 
-then `sudo systemctl reload apache2`. The install-time vhost references
-those exact paths; no Apache config edits needed.
+Then write `/etc/apache2/sites-available/userspice-ansible-ssl.conf`:
+
+```apache
+<VirtualHost *:443>
+    ServerAdmin webmaster@localhost
+    DocumentRoot /var/www/html/userspice-ansible
+
+    SSLEngine on
+    SSLCertificateFile /etc/ssl/certs/your-cert.crt
+    SSLCertificateKeyFile /etc/ssl/private/your-key.key
+
+    <Directory /var/www/html/userspice-ansible>
+        Options Indexes FollowSymLinks
+        AllowOverride All
+        Require all granted
+    </Directory>
+</VirtualHost>
+```
+
+Then `sudo a2ensite userspice-ansible-ssl && sudo systemctl reload apache2`.
+Same caveat as Option B: keep port 80 working without forcing redirect,
+or guard the redirect with a loopback exemption, so the run-finish
+callback isn't broken.
 
 ## Multiple operator IPs
 
@@ -100,21 +125,26 @@ sudo ufw deny 22       # belt-and-suspenders even after sshd is off
 ## Don't enable UserSpice's `force_ssl` setting
 
 The UserSpice admin → Security dashboard has a "Force HTTPS" toggle
-(it flips `settings.force_ssl` in the database to 1). **Leave it off.**
+(it flips `settings.force_ssl` in the database to 1). **Leave it off**
+even after you've enabled HTTPS via one of the options above.
 
-The Apache layer already redirects external HTTP to HTTPS. Toggling
-`force_ssl` adds a *second* redirect at the PHP layer (in
-`users/includes/loader.php`), and that one fires on **every** request
-that loads `users/init.php` — including the loopback callback the
-run-wrapper makes to `run_finish.php` after each playbook run. The
-wrapper's `curl` doesn't follow redirects, so finished_at on your
-audit rows stops getting stamped. Runs still complete, but the UI
-shows them as "running" forever.
+`force_ssl` adds a redirect at the PHP layer (in
+`users/includes/loader.php`) that fires on **every** request loading
+`users/init.php` — including the loopback callback the run-wrapper
+makes to `run_finish.php` after each playbook run. The wrapper's
+`curl` doesn't follow redirects, so `finished_at` on your audit rows
+stops getting stamped. Runs still complete, but the UI shows them as
+"running" forever.
 
-If you absolutely need PHP-layer SSL enforcement (e.g., you've
-disabled the Apache redirect because you're running behind something
-that already terminates TLS), update `helper.php`'s `$finish_url` to
-use HTTPS and add `-k -L --post301` to `run_wrapper.sh`'s curl call.
+The right place to enforce HTTPS is the Apache layer (or your reverse
+proxy / Tailscale serve). All three options above either don't redirect
+loopback or let you exempt it. The PHP-layer toggle has no exemption
+mechanism — it'll always break the callback.
+
+If you absolutely need PHP-layer enforcement (say, you're running
+behind something that already terminates TLS and forwards plain HTTP),
+update `helper.php`'s `$finish_url` to use HTTPS and add `-k -L --post301`
+to `run_wrapper.sh`'s curl call.
 
 ## Vault password backup
 
