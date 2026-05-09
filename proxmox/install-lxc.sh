@@ -26,7 +26,7 @@ DB_NAME="ansible-ui"
 # Pin clone to the matching release tag. If the tag is missing on origin
 # (rare — usually a fresh installer pulled from main before tags push),
 # the clone falls back to main with a warning.
-INSTALLER_VERSION="0.2.1"
+INSTALLER_VERSION="0.2.2"
 
 DEFAULT_HOSTNAME="userspice-ansible"
 DEFAULT_DISK="8"        # GB — LAMP + ansible needs ~3GB
@@ -723,27 +723,12 @@ if [[ ! -f "$INVENTORY" ]]; then
 fi
 chown ansible:ansible "$INVENTORY"
 
-# Pre-register the LXC itself as a read-only managed host. Uses the
-# `local` connection (no SSH, runs as www-data) so playbooks that don't
-# need root work immediately — disk.yml, memory.yml, glance.yml, etc.
-# Playbooks with `become: true` (firewall, services, certs) will fail
-# with "cannot escalate" — that's intentional. Mutating the control
-# node from the UI would risk locking the user out, so it's blocked
-# by design. Configure a remote host for those playbooks.
-if ! grep -q '^\[local\]' "$INVENTORY"; then
-    cat >> "$INVENTORY" <<INVENTORY_LOCAL
-
-# --- The control node itself (this LXC) ---
-# Pre-registered at install time as READ-ONLY. The local connection
-# runs as www-data with no sudo, so mutating playbooks (anything with
-# become: true) will fail — that's intentional. To enable full
-# management of the LXC from the UI, replace this block with:
-#   $LXC_HOSTNAME ansible_host=localhost ansible_user=root
-# and add www-data's pubkey to /root/.ssh/authorized_keys.
-[local]
-$LXC_HOSTNAME ansible_connection=local
-INVENTORY_LOCAL
-fi
+# The LXC itself is intentionally NOT in the inventory by default. Earlier
+# versions auto-registered it under [local] with ansible_connection=local
+# so disk.yml / memory.yml / glance.yml worked out of the box, but
+# anything with `become: true` produced cryptic "sudo: a password is
+# required" errors and bootstrap.yml failed on undefined ansible_user.
+# Operators who really want self-management can opt in — see HARDENING.md.
 chown ansible:ansible "$INVENTORY"
 chmod 664 "$INVENTORY"
 DBSCRIPT

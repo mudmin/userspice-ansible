@@ -146,6 +146,43 @@ behind something that already terminates TLS and forwards plain HTTP),
 update `helper.php`'s `$finish_url` to use HTTPS and add `-k -L --post301`
 to `run_wrapper.sh`'s curl call.
 
+## Self-managing the control node
+
+The installer deliberately does **not** add the LXC itself to the
+inventory. Two reasons:
+
+1. The local connection runs as the `ansible` user with no passwordless
+   sudo (the boundary that keeps the web UI from rooting its own
+   container — see the threat model in the README). Anything with
+   `become: true` would fail with a cryptic *"sudo: a password is
+   required"*. Earlier versions papered over this by leaving the LXC
+   in inventory and treating it as "read-only" — the failures just
+   moved from explicit to confusing.
+2. A misclick on `firewall.yml` or `update.yml` against the control
+   node could lock you out of your own appliance. Excluding it from
+   the dashboard removes that footgun.
+
+If you genuinely want to manage the LXC from its own UI (homelab use,
+single-operator who'll never confuse targets), add it explicitly. SSH
+to localhost as root, with the `ansible` user's pubkey installed:
+
+```sh
+# On the LXC, as root:
+sudo -u ansible cat /home/ansible/.ssh/id_ed25519.pub >> /root/.ssh/authorized_keys
+chmod 600 /root/.ssh/authorized_keys
+
+# Append to /var/www/html/userspice-ansible/playbooks/inventory.ini:
+cat >> /var/www/html/userspice-ansible/playbooks/inventory.ini <<'EOF'
+
+[control]
+this-lxc ansible_host=localhost ansible_user=root ansible_ssh_private_key_file=~/.ssh/id_ed25519
+EOF
+chown ansible:ansible /var/www/html/userspice-ansible/playbooks/inventory.ini
+```
+
+Now `become: true` works (you're already root over SSH), and the LXC
+shows up in the dashboard. **Don't run `firewall.yml` against it.**
+
 ## Vault password backup
 
 The vault password is generated at install and printed *once*. Every

@@ -49,9 +49,11 @@ source. Skipping it leaves the LXC reachable from anywhere on its network.
    HTTP — appropriate for an internal LXC reached over LAN, Tailscale,
    or VPN. To enable HTTPS with a real cert, see
    [HARDENING.md](HARDENING.md).
-2. Run `add-server` on the LXC console to onboard your fleet hosts. The
-   wizard handles SSH keys, sudo passwords, vault encryption, and
-   inventory grouping.
+2. Run `add-server` on the LXC console to onboard your first remote host.
+   The wizard handles SSH keys, sudo passwords, vault encryption, and
+   inventory grouping. **The dashboard is empty until at least one host
+   is onboarded** — by design, the LXC itself is not pre-registered (see
+   [HARDENING.md](HARDENING.md) if you want self-management anyway).
 3. Click any playbook in the dashboard, pick a target, click **Check**
    for a dry run, then **Run** to apply.
 
