@@ -49,13 +49,30 @@ CGNAT.
 
 ### Option B — Tailscale serve (tailnet)
 
+**Heads-up: the installer can do this for you.** If you answered yes to
+the *"Install Tailscale + serve the web UI on your tailnet over HTTPS?"*
+prompt during install, this section is already in place — skip ahead to
+[Enable `force_ssl`](#enable-force_ssl-in-userspice-after-https-is-up).
+The rest of this section is for operators who skipped that prompt and
+want to add Tailscale serve manually.
+
 `tailscale serve` issues and renews a cert via **Tailscale's CA** (not
 Let's Encrypt — different ACME workflow, same end result of a real
 padlock for clients on your tailnet). The clean MagicDNS name
 (`<machine>.<tailnet>.ts.net`) just works.
 
 ```sh
-# Inside the LXC, after `tailscale up`:
+# Inside the LXC:
+curl -fsSL https://tailscale.com/install.sh | sh
+
+# Unprivileged LXCs need userspace networking (no /dev/net/tun passthrough).
+sudo tee /etc/default/tailscaled > /dev/null <<'EOF'
+PORT="41641"
+FLAGS="--tun=userspace-networking"
+EOF
+sudo systemctl restart tailscaled
+
+sudo tailscale up --hostname="$(hostname)" --accept-routes=false --accept-dns=false
 sudo tailscale serve --bg https / http://localhost:80
 ```
 

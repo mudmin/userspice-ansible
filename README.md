@@ -30,9 +30,18 @@ Creates an unprivileged Ubuntu 24.04 LXC with Apache, MariaDB, and Ansible
 pre-installed; clones this repo; sets up the database; and prompts you for
 an admin email + password.
 
-The installer asks: *"Restrict access to a single IP?"* — answer with the
-operator workstation's IP if you want the LXC firewalled to that one
-source. Skipping it leaves the LXC reachable from anywhere on its network.
+The installer also asks:
+
+- *"Use DHCP?"* — answer no to set a static IP / gateway / DNS.
+- *"Restrict access to a single IP?"* — answer with the operator
+  workstation's IP if you want the LXC firewalled to that one source.
+  Skipping it leaves the LXC reachable from anywhere on its bridge.
+- *"Install Tailscale + serve the web UI on your tailnet over HTTPS?"* —
+  answer yes for one-step HTTPS with a real cert from Tailscale's CA.
+  Either paste a pre-auth key from
+  [the Tailscale admin](https://login.tailscale.com/admin/settings/keys)
+  for unattended auth, or leave it blank and click the auth URL when it
+  appears.
 
 ## What's in here
 
@@ -45,9 +54,10 @@ source. Skipping it leaves the LXC reachable from anywhere on its network.
 ## After install
 
 1. Open the UI at the URL printed by the installer and log in with the
-   admin credentials you set during install. The installer ships plain
-   HTTP — appropriate for an internal LXC reached over LAN, Tailscale,
-   or VPN. To enable HTTPS with a real cert, see
+   admin credentials you set during install. If you opted into Tailscale
+   the installer prints an `https://<host>.<tailnet>.ts.net/` URL with a
+   real cert. Otherwise the install is plain HTTP — appropriate for an
+   internal LXC reached over LAN or VPN; to add HTTPS after the fact, see
    [HARDENING.md](HARDENING.md).
 2. Run `add-server` on the LXC console to onboard your first remote host.
    The wizard handles SSH keys, sudo passwords, vault encryption, and

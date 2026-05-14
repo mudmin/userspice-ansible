@@ -26,7 +26,7 @@ DB_NAME="ansible-ui"
 # Pin clone to the matching release tag. If the tag is missing on origin
 # (rare — usually a fresh installer pulled from main before tags push),
 # the clone falls back to main with a warning.
-INSTALLER_VERSION="0.3.1"
+INSTALLER_VERSION="0.4.0"
 
 DEFAULT_HOSTNAME="userspice-ansible"
 DEFAULT_DISK="8"        # GB — LAMP + ansible needs ~3GB
@@ -154,6 +154,27 @@ if [[ "${INSTALL_PMA_ANSWER,,}" == "y" || "${INSTALL_PMA_ANSWER,,}" == "yes" ]];
     INSTALL_PMA=1
 fi
 
+# Optional Tailscale install. Yes → run `tailscale up` inside the LXC, optionally
+# with a pre-auth key for unattended auth, then `tailscale serve` to terminate
+# HTTPS on the tailnet IP with a Tailscale-CA cert. Tailscale runs in userspace
+# networking mode so this works in unprivileged LXCs without host-level TUN
+# passthrough — the trade-off is no exit-node / subnet-router support, fine for
+# our "expose the web UI on tailnet" use case.
+ask "Install Tailscale + serve the web UI on your tailnet over HTTPS? [y/N]:"
+read -r INSTALL_TS_ANSWER
+INSTALL_TS=0
+TS_AUTHKEY=""
+if [[ "${INSTALL_TS_ANSWER,,}" == "y" || "${INSTALL_TS_ANSWER,,}" == "yes" ]]; then
+    INSTALL_TS=1
+    echo ""
+    echo -e "  ${YELLOW}A pre-auth key (tskey-...) lets us authenticate unattended.${NC}"
+    echo -e "  ${YELLOW}Generate one at: https://login.tailscale.com/admin/settings/keys${NC}"
+    echo -e "  ${YELLOW}Leave blank to authenticate interactively after install${NC}"
+    echo -e "  ${YELLOW}(installer will print a URL you click in a browser).${NC}"
+    ask "Tailscale pre-auth key (optional, leave blank to skip):"
+    read -r TS_AUTHKEY
+fi
+
 # Generate cookie/session names now so they're consistent across the install
 COOKIE_NAME="$(gen_token)"
 SESSION_NAME="$(gen_token)"
@@ -199,6 +220,33 @@ ask "Network bridge [${DEFAULT_BRIDGE}]:"
 read -r BRIDGE
 BRIDGE="${BRIDGE:-$DEFAULT_BRIDGE}"
 
+# Network config: default DHCP. Operators on networks without DHCP, or who
+# want a predictable IP for DNS / firewall rules, can opt into static.
+ask "Use DHCP? [Y/n]:"
+read -r USE_DHCP_ANSWER
+USE_DHCP=1
+STATIC_CIDR=""
+STATIC_GW=""
+STATIC_DNS=""
+if [[ "${USE_DHCP_ANSWER,,}" == "n" || "${USE_DHCP_ANSWER,,}" == "no" ]]; then
+    USE_DHCP=0
+    while :; do
+        ask "Static IP with CIDR (e.g. 192.168.1.50/24):"
+        read -r STATIC_CIDR
+        if [[ "$STATIC_CIDR" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$ ]]; then break; fi
+        warn "\"$STATIC_CIDR\" doesn't look like IP/CIDR — try again."
+    done
+    while :; do
+        ask "Gateway (e.g. 192.168.1.1):"
+        read -r STATIC_GW
+        if [[ "$STATIC_GW" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then break; fi
+        warn "\"$STATIC_GW\" doesn't look like an IP — try again."
+    done
+    ask "DNS server [1.1.1.1]:"
+    read -r STATIC_DNS
+    STATIC_DNS="${STATIC_DNS:-1.1.1.1}"
+fi
+
 ask "Template storage [${DEFAULT_TEMPLATE_STORAGE}]:"
 read -r TEMPLATE_STORAGE
 TEMPLATE_STORAGE="${TEMPLATE_STORAGE:-$DEFAULT_TEMPLATE_STORAGE}"
@@ -214,9 +262,20 @@ echo "  Hostname:        ${HOSTNAME}"
 echo "  Disk:            ${DISK} GB on ${CT_STORAGE}"
 echo "  CPU / RAM:       ${CORES} cores / ${RAM} MB"
 echo "  Bridge:          ${BRIDGE}"
+if [[ $USE_DHCP -eq 1 ]]; then
+    echo "  Network:         DHCP"
+else
+    echo "  Network:         static ${STATIC_CIDR} via ${STATIC_GW}, DNS ${STATIC_DNS}"
+fi
 echo "  Admin email:     ${ADMIN_EMAIL}"
 echo "  IP lock (web+SSH): ${RESTRICT_IP:-<none — unrestricted>}"
 echo "  phpMyAdmin:      $([[ $INSTALL_PMA -eq 1 ]] && echo "yes" || echo "no")"
+if [[ $INSTALL_TS -eq 1 ]]; then
+    TS_AUTH_LABEL=$([[ -n "$TS_AUTHKEY" ]] && echo "pre-auth key" || echo "interactive URL")
+    echo "  Tailscale:       yes (${TS_AUTH_LABEL})"
+else
+    echo "  Tailscale:       no"
+fi
 echo ""
 ask "Proceed? [Y/n]:"
 read -r CONFIRM
@@ -252,13 +311,22 @@ ok "Template: ${LATEST_TEMPLATE}"
 
 # ---- Create container ----
 step "Creating LXC ${CTID}"
+if [[ $USE_DHCP -eq 1 ]]; then
+    NET0_ARG="name=eth0,bridge=${BRIDGE},firewall=1,ip=dhcp,ip6=auto"
+    NAMESERVER_ARGS=()
+else
+    NET0_ARG="name=eth0,bridge=${BRIDGE},firewall=1,ip=${STATIC_CIDR},gw=${STATIC_GW}"
+    NAMESERVER_ARGS=(--nameserver "$STATIC_DNS")
+fi
+
 if ! pct create "$CTID" "$TEMPLATE_PATH" \
         --hostname "$HOSTNAME" \
         --cores "$CORES" \
         --memory "$RAM" \
         --swap "$DEFAULT_SWAP" \
         --rootfs "${CT_STORAGE}:${DISK}" \
-        --net0 "name=eth0,bridge=${BRIDGE},firewall=1,ip=dhcp,ip6=auto" \
+        --net0 "$NET0_ARG" \
+        "${NAMESERVER_ARGS[@]}" \
         --features "nesting=1,keyctl=1" \
         --unprivileged 1 \
         --onboot 1 \
@@ -506,6 +574,16 @@ cat <<EOF
   Web UI:        http://${IP}/
 EOF
 
+# Tailscale URL is optional — only show when tailscaled is running and
+# serve is configured. Self-detects so the MOTD stays correct if Tailscale
+# is added or removed later.
+if command -v tailscale >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+    TS_DNS=$(tailscale status --json 2>/dev/null | jq -r '.Self.DNSName' 2>/dev/null | sed 's/\.$//')
+    if [[ -n "$TS_DNS" && "$TS_DNS" != "null" ]]; then
+        echo "  Web UI (TS):   https://${TS_DNS}/"
+    fi
+fi
+
 # phpMyAdmin is optional — only show its URL when it's actually installed.
 # Self-detects so the MOTD stays correct if it's added or removed later.
 if [[ -d /usr/share/phpmyadmin ]]; then
@@ -738,6 +816,89 @@ ok "Database imported, admin user set, init.php rendered"
 # ---- Final restart + summary ----
 pct exec "$CTID" -- systemctl restart apache2 >/dev/null 2>&1 || true
 
+# ---- Optional Tailscale install + tailscale serve ----
+# Runs LAST because tailscale serve needs Apache up on :80, and we want the
+# final banner to include the tailnet URL if Tailscale came online.
+TS_DNS_NAME=""
+TS_STATUS=""   # "up" | "url-pending" | "failed" | ""
+if [[ $INSTALL_TS -eq 1 ]]; then
+    step "Installing Tailscale (userspace networking for unprivileged LXC)"
+    pct exec "$CTID" -- env TS_AUTHKEY="$TS_AUTHKEY" bash <<'TAILSCALE_INSTALL'
+set -e
+
+# Official installer — adds the Tailscale apt repo and installs tailscaled.
+curl -fsSL https://tailscale.com/install.sh | sh >/dev/null
+
+# Userspace networking: required in unprivileged LXCs because /dev/net/tun
+# isn't passed through by default. Trade-off is no exit-node / subnet-router
+# support, which we don't need for "serve the UI on the tailnet" anyway.
+mkdir -p /etc/default
+cat > /etc/default/tailscaled <<'EOF'
+PORT="41641"
+FLAGS="--tun=userspace-networking"
+EOF
+
+systemctl enable --now tailscaled
+# Brief pause for the daemon to settle before `tailscale up`.
+sleep 2
+
+# jq for parsing `tailscale status --json` later.
+apt-get install -yq jq >/dev/null
+TAILSCALE_INSTALL
+    ok "Tailscale installed; tailscaled running in userspace mode"
+
+    if [[ -n "$TS_AUTHKEY" ]]; then
+        step "Authenticating Tailscale with provided pre-auth key"
+        if pct exec "$CTID" -- tailscale up \
+                --authkey="$TS_AUTHKEY" \
+                --hostname="$HOSTNAME" \
+                --accept-routes=false \
+                --accept-dns=false 2>/dev/null; then
+            TS_STATUS="up"
+            ok "Tailscale authenticated"
+        else
+            TS_STATUS="failed"
+            warn "Tailscale auth failed — install continues without tailscale serve. Run 'tailscale up' manually inside the LXC."
+        fi
+    else
+        echo ""
+        echo -e "  ${YELLOW}Tailscale needs interactive authentication.${NC}"
+        echo -e "  ${YELLOW}When the URL appears below, click it, sign in, then return here.${NC}"
+        echo ""
+        # Background `tailscale up` so we can grab the URL it prints. It blocks
+        # until the user authenticates in the browser.
+        if pct exec "$CTID" -- timeout 300 tailscale up \
+                --hostname="$HOSTNAME" \
+                --accept-routes=false \
+                --accept-dns=false; then
+            TS_STATUS="up"
+            ok "Tailscale authenticated"
+        else
+            TS_STATUS="failed"
+            warn "Tailscale auth timed out or failed — install continues without tailscale serve."
+            warn "Run 'tailscale up' manually inside the LXC to finish setup."
+        fi
+    fi
+
+    if [[ "$TS_STATUS" == "up" ]]; then
+        step "Configuring tailscale serve (HTTPS proxy to Apache:80)"
+        # Capture the magic DNS name for the final banner. Trailing dot is normal.
+        TS_DNS_NAME=$(pct exec "$CTID" -- bash -c \
+            "tailscale status --json | jq -r .Self.DNSName | sed 's/\.\$//'" \
+            2>/dev/null | tr -d '[:space:]')
+
+        # `tailscale serve --bg https / http://localhost:80` terminates TLS on
+        # the tailnet IP using a Tailscale-CA cert and proxies to Apache on
+        # loopback:80. Config persists in tailscaled state across restarts.
+        if pct exec "$CTID" -- tailscale serve --bg https / http://localhost:80 >/dev/null 2>&1; then
+            ok "tailscale serve up — https://${TS_DNS_NAME}/ proxies to Apache:80"
+        else
+            warn "tailscale serve failed. Run manually: tailscale serve --bg https / http://localhost:80"
+            TS_STATUS="failed"
+        fi
+    fi
+fi
+
 CT_IP=$(pct exec "$CTID" -- bash -c "hostname -I | awk '{print \$1}'" 2>/dev/null | tr -d '[:space:]')
 SSH_PUBKEY=$(pct exec "$CTID" -- cat /home/ansible/.ssh/id_ed25519.pub 2>/dev/null || echo "<failed-to-read>")
 
@@ -773,16 +934,29 @@ echo -e "  ${YELLOW}Stored on the LXC at: /home/ansible/.ansible/vault_pass.txt$
 echo -e "${RED}${BOLD}=================================================================${NC}"
 echo ""
 echo -e "  Web UI:      ${BOLD}http://${CT_IP:-<ip>}/${NC}"
+if [[ "$TS_STATUS" == "up" && -n "$TS_DNS_NAME" ]]; then
+    echo -e "  Web UI (TS): ${BOLD}https://${TS_DNS_NAME}/${NC}   (tailnet, real cert)"
+fi
 if [[ $INSTALL_PMA -eq 1 ]]; then
     echo -e "  phpMyAdmin:  ${BOLD}http://${CT_IP:-<ip>}/phpmyadmin/${NC}   (root / MariaDB password)"
 fi
 echo -e "  SSH:         ${BOLD}ssh root@${CT_IP:-<ip>}${NC}"
 echo -e "  Console:     ${BOLD}pct enter ${CTID}${NC}"
 echo ""
-echo -e "  ${YELLOW}Web UI is plain HTTP. For an isolated LXC reached over LAN,${NC}"
-echo -e "  ${YELLOW}Tailscale, or VPN, that's deliberate. To add HTTPS (Let's${NC}"
-echo -e "  ${YELLOW}Encrypt for a real domain, Tailscale serve for a tailnet,${NC}"
-echo -e "  ${YELLOW}or BYO cert) see HARDENING.md.${NC}"
+if [[ "$TS_STATUS" == "up" ]]; then
+    echo -e "  ${YELLOW}HTTPS is live on the tailnet via tailscale serve (real cert from${NC}"
+    echo -e "  ${YELLOW}Tailscale's CA). Plain HTTP on ${CT_IP:-<ip>} also works on the LAN.${NC}"
+    echo -e "  ${YELLOW}Enable UserSpice's force_ssl in the admin panel to redirect HTTP${NC}"
+    echo -e "  ${YELLOW}→ HTTPS for clients on the tailnet. See HARDENING.md.${NC}"
+elif [[ "$TS_STATUS" == "failed" ]]; then
+    echo -e "  ${YELLOW}Tailscale install attempted but didn't come online. Web UI is${NC}"
+    echo -e "  ${YELLOW}plain HTTP. See HARDENING.md to finish setup manually.${NC}"
+else
+    echo -e "  ${YELLOW}Web UI is plain HTTP. For an isolated LXC reached over LAN,${NC}"
+    echo -e "  ${YELLOW}Tailscale, or VPN, that's deliberate. To add HTTPS (Let's${NC}"
+    echo -e "  ${YELLOW}Encrypt for a real domain, Tailscale serve for a tailnet,${NC}"
+    echo -e "  ${YELLOW}or BYO cert) see HARDENING.md.${NC}"
+fi
 if [[ -n "$RESTRICT_IP" ]]; then
     echo ""
     echo -e "  ${YELLOW}Access (web + SSH) restricted to IP: ${BOLD}${RESTRICT_IP}${NC}"
