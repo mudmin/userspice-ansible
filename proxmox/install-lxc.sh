@@ -26,7 +26,7 @@ DB_NAME="ansible-ui"
 # Pin clone to the matching release tag. If the tag is missing on origin
 # (rare — usually a fresh installer pulled from main before tags push),
 # the clone falls back to main with a warning.
-INSTALLER_VERSION="0.3.0"
+INSTALLER_VERSION="0.3.1"
 
 DEFAULT_HOSTNAME="userspice-ansible"
 DEFAULT_DISK="8"        # GB — LAMP + ansible needs ~3GB
@@ -321,6 +321,7 @@ apt-get install -yq --no-install-recommends \
     libapache2-mod-php \
     ansible \
     git curl wget unzip openssh-server openssh-client sudo ca-certificates openssl \
+    sshpass \
     composer
 
 systemctl enable --now apache2
