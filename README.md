@@ -120,10 +120,10 @@ What this stack does **not** do for you:
 
 ## Hardening
 
-See [HARDENING.md](HARDENING.md) for replacing the self-signed cert
-(Tailscale, Let's Encrypt, BYO), adding multiple operator IPs, disabling
-SSH entirely, backing up the vault password, and tightening the sudoers
-rule.
+See [HARDENING.md](HARDENING.md) for adding HTTPS (Let's Encrypt for a
+real domain, Tailscale serve for a tailnet, or BYO cert), adding
+multiple operator IPs, disabling SSH entirely, backing up the vault
+password, and tightening the sudoers rule.
 
 ## License
 

@@ -1,0 +1,154 @@
+---
+# reboot.yml — reboot hosts that have a pending-reboot flag. On Debian/
+# Ubuntu the flag is /var/run/reboot-required, written by update-notifier
+# when a kernel/libc/dbus/etc. upgrade lands (the same file update.yml
+# already reports). Mutating only when apply=true.
+#
+# UI_PARAMS:
+#   apply:        bool default=false
+#   reboot_force: bool default=false
+#
+# apply=false (default) is preview-only:
+#   - reports, per host, whether /var/run/reboot-required exists and the
+#     package list from /var/run/reboot-required.pkgs that triggered it
+#   - reboots nothing (reboot_force is shown in the preview but not acted on)
+#
+# apply=true:
+#   - reboots every targeted host that has the flag set, all at once
+#     (no serial throttle — these are independent VPS), then waits for
+#     SSH to come back (reboot_timeout=600)
+#   - hosts without the flag are left alone …unless reboot_force=true,
+#     in which case *every* targeted host is rebooted regardless of the
+#     flag (the "bounce these boxes now" case). reboot_force does nothing
+#     on its own — it still needs apply=true to fire.
+#
+# Scope with --limit; preview first. reboot_force + a wide --limit is the
+# foot-gun in this file — it will reboot the whole group at once.
+#
+# When `ui_report_path` is set, also emits a structured JSON report.
+#
+#   ansible-playbook reboot.yml                                       # preview whole fleet
+#   ansible-playbook reboot.yml --limit managed_vps                   # preview a group
+#   ansible-playbook reboot.yml --limit deploy-spice -e apply=true    # reboot if needed
+#   ansible-playbook reboot.yml --limit omt-cms -e apply=true -e reboot_force=true   # reboot now
+#   ansible-playbook reboot.yml -e apply=true -e ui_report_path=/tmp/reboot.json
+
+- name: Reboot hosts that need it
+  hosts: all
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Validate parameters
+      ansible.builtin.assert:
+        that:
+          - (apply | default(false) | string) in ['True', 'False', 'true', 'false']
+          - (reboot_force | default(false) | string) in ['True', 'False', 'true', 'false']
+        fail_msg: "apply and reboot_force must each be true|false"
+        quiet: true
+      run_once: true
+      delegate_to: localhost
+      become: false
+
+    - name: Check for the pending-reboot flag
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: rr_flag
+
+    - name: Read the triggering package list (if any)
+      ansible.builtin.slurp:
+        src: /var/run/reboot-required.pkgs
+      register: rr_pkgs_raw
+      when: rr_flag.stat.exists
+      failed_when: false
+
+    - name: Capture uptime before
+      ansible.builtin.command: uptime -s
+      register: uptime_before
+      changed_when: false
+
+    - name: Decide whether this host reboots
+      ansible.builtin.set_fact:
+        # apply gates everything; then reboot iff the flag is set OR
+        # reboot_force overrides it.
+        do_reboot: "{{ (apply | default(false) | bool) and (rr_flag.stat.exists or (reboot_force | default(false) | bool)) }}"
+        reboot_record:
+          needs_reboot: "{{ rr_flag.stat.exists }}"
+          forced: "{{ (reboot_force | default(false) | bool) and not rr_flag.stat.exists }}"
+          pkgs: >-
+            {{ (rr_pkgs_raw.content | default('') | b64decode).splitlines()
+               if (rr_flag.stat.exists and rr_pkgs_raw.content is defined)
+               else [] }}
+          booted_at_before: "{{ uptime_before.stdout | trim }}"
+          rebooted: false
+          booted_at_after: null
+
+    - name: Reboot
+      ansible.builtin.reboot:
+        reboot_timeout: 600
+        msg: >-
+          Reboot triggered by ansible reboot.yml
+          ({{ 'forced' if reboot_record.forced else 'pending-reboot flag set' }})
+      when: do_reboot
+
+    - name: Capture uptime after reboot
+      ansible.builtin.command: uptime -s
+      register: uptime_after
+      changed_when: false
+      when: do_reboot
+
+    - name: Update record post-reboot
+      ansible.builtin.set_fact:
+        reboot_record: >-
+          {{ reboot_record | combine({
+               'rebooted': true,
+               'booted_at_after': uptime_after.stdout | trim
+             }) }}
+      when: do_reboot
+
+    - name: Per-host reboot summary
+      vars:
+        after_suffix: "{{ '  →  back up at ' ~ reboot_record.booted_at_after if reboot_record.rebooted else '' }}"
+        would_reboot: "{{ reboot_record.needs_reboot or (reboot_force | default(false) | bool) }}"
+        why: "{{ 'pending-reboot flag' if reboot_record.needs_reboot else 'forced' }}"
+      ansible.builtin.debug:
+        msg: |-
+          === {{ inventory_hostname }} ===
+          Mode: {{ 'APPLY' if (apply | default(false) | bool) else 'preview' }}{{ '  (reboot_force)' if (reboot_force | default(false) | bool) else '' }}
+          Needs reboot: {{ 'YES' if reboot_record.needs_reboot else 'no' }}{{ '  (triggered by: ' ~ (reboot_record.pkgs | join(', ')) ~ ')' if reboot_record.pkgs | length else '' }}
+          Action: {{ ('REBOOTED (' ~ why ~ ')') if reboot_record.rebooted else (('would reboot on apply=true (' ~ why ~ ')') if would_reboot else 'nothing to do') }}{{ after_suffix }}
+
+  post_tasks:
+    - name: Emit structured reboot report for the UI
+      delegate_to: localhost
+      become: false
+      run_once: true
+      check_mode: false
+      when: ui_report_path is defined
+      ansible.builtin.copy:
+        dest: "{{ ui_report_path }}"
+        mode: "0644"
+        content: |-
+          {
+            "report_type": "reboot",
+            "generated_at": {{ lookup('pipe', 'date -u +%FT%TZ') | to_json }},
+            "params": {
+              "apply":        {{ (apply | default(false) | bool) | to_json }},
+              "reboot_force": {{ (reboot_force | default(false) | bool) | to_json }}
+            },
+            "hosts": [
+              {%- for h in ansible_play_hosts_all | sort %}
+              {%- set hv = hostvars[h] %}
+              {%- set r = hv.reboot_record | default({}) %}
+              {
+                "name":             {{ h | to_json }},
+                "needs_reboot":     {{ (r.needs_reboot | default(false)) | to_json }},
+                "forced":           {{ (r.forced | default(false)) | to_json }},
+                "pkgs":             {{ (r.pkgs | default([])) | to_json }},
+                "rebooted":         {{ (r.rebooted | default(false)) | to_json }},
+                "booted_at_before": {{ (r.booted_at_before | default(None)) | to_json }},
+                "booted_at_after":  {{ (r.booted_at_after  | default(None)) | to_json }}
+              }{% if not loop.last %},{% endif %}
+              {%- endfor %}
+            ]
+          }

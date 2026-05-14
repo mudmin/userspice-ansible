@@ -26,7 +26,7 @@ DB_NAME="ansible-ui"
 # Pin clone to the matching release tag. If the tag is missing on origin
 # (rare — usually a fresh installer pulled from main before tags push),
 # the clone falls back to main with a warning.
-INSTALLER_VERSION="0.2.2"
+INSTALLER_VERSION="0.3.0"
 
 DEFAULT_HOSTNAME="userspice-ansible"
 DEFAULT_DISK="8"        # GB — LAMP + ansible needs ~3GB
@@ -434,9 +434,10 @@ chmod 600 /home/ansible/.ansible/vault_pass.txt
 # Optional: restrict all access to a single IP. Two layers in concert:
 #   1. Apache Require ip on the app's filesystem path (and on phpMyAdmin's
 #      separate path when it's installed) — defense in depth at the HTTP layer.
-#   2. ufw rules — the real boundary. Locks ports 22 / 80 / 443 to the operator
-#      IP at the network layer, which is what actually keeps SSH and
-#      phpMyAdmin contained.
+#   2. ufw rules — the real boundary. Locks ports 22 / 80 to the operator IP
+#      at the network layer, which is what actually keeps SSH and
+#      phpMyAdmin contained. (443 stays open by default — see HARDENING.md;
+#      operators who add HTTPS open it themselves.)
 if [[ -n "$RESTRICT_IP" ]]; then
     cat > /etc/apache2/conf-available/99-userspice-ansible-restrict.conf <<APACHERESTRICT
 <Directory /var/www/html>
@@ -461,10 +462,9 @@ APACHEPMA
     ufw default allow outgoing >/dev/null
     ufw allow from "$RESTRICT_IP" to any port 22 proto tcp >/dev/null
     ufw allow from "$RESTRICT_IP" to any port 80 proto tcp >/dev/null
-    ufw allow from "$RESTRICT_IP" to any port 443 proto tcp >/dev/null
     if ! ufw --force enable >/dev/null 2>&1; then
         echo "WARNING: ufw enable failed inside the LXC. Apache Require ip is" >&2
-        echo "still active for HTTP/HTTPS, but SSH is NOT firewalled. Lock SSH" >&2
+        echo "still active for HTTP, but SSH is NOT firewalled. Lock SSH" >&2
         echo "manually (Proxmox firewall on the bridge, or sshd ListenAddress)." >&2
     fi
 fi
@@ -779,14 +779,14 @@ echo -e "  SSH:         ${BOLD}ssh root@${CT_IP:-<ip>}${NC}"
 echo -e "  Console:     ${BOLD}pct enter ${CTID}${NC}"
 echo ""
 echo -e "  ${YELLOW}Web UI is plain HTTP. For an isolated LXC reached over LAN,${NC}"
-echo -e "  ${YELLOW}Tailscale, or VPN, that's deliberate. To enable HTTPS with${NC}"
-echo -e "  ${YELLOW}a real cert (Tailscale serve / Let's Encrypt / BYO): see${NC}"
-echo -e "  ${YELLOW}HARDENING.md. ufw already allows 443 from the operator IP.${NC}"
+echo -e "  ${YELLOW}Tailscale, or VPN, that's deliberate. To add HTTPS (Let's${NC}"
+echo -e "  ${YELLOW}Encrypt for a real domain, Tailscale serve for a tailnet,${NC}"
+echo -e "  ${YELLOW}or BYO cert) see HARDENING.md.${NC}"
 if [[ -n "$RESTRICT_IP" ]]; then
     echo ""
     echo -e "  ${YELLOW}Access (web + SSH) restricted to IP: ${BOLD}${RESTRICT_IP}${NC}"
-    echo -e "  ${YELLOW}ufw is active with allow rules for ports 22, 80, 443 from that IP.${NC}"
-    echo -e "  ${YELLOW}To add another operator IP: see HARDENING.md.${NC}"
+    echo -e "  ${YELLOW}ufw is active with allow rules for ports 22 and 80 from that IP.${NC}"
+    echo -e "  ${YELLOW}To add another operator IP or open 443: see HARDENING.md.${NC}"
 else
     echo ""
     echo -e "  ${YELLOW}No IP restriction set — anyone on the bridge network can reach${NC}"

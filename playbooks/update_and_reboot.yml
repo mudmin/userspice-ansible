@@ -1,0 +1,31 @@
+---
+# update_and_reboot.yml — apt update + dist-upgrade, then reboot any host
+# that the upgrade left needing one. Thin wrapper: it imports update.yml
+# and reboot.yml back-to-back so there's a single entrypoint for the
+# common "patch the fleet and bounce what needs bouncing" maintenance run.
+#
+# UI_PARAMS:
+#   apply:        bool default=false
+#   reboot_force: bool default=false
+#
+# Asymmetry to know about: the apt upgrade ALWAYS runs (update.yml is not
+# gated) — it's `apt update && apt upgrade -y`, which is safe to repeat.
+# The reboot half honours apply/reboot_force exactly as reboot.yml does:
+#   - apply=false (default): upgrade, then *preview* which hosts now need
+#     a reboot. Reboots nothing.
+#   - apply=true: upgrade, then reboot every host with /var/run/reboot-
+#     required set, all at once. Add reboot_force=true to reboot every
+#     targeted host regardless of the flag.
+#
+# Scope with --limit; preview first. -e apply=true with a wide --limit
+# will reboot the whole group together once the upgrade finishes.
+#
+#   ansible-playbook update_and_reboot.yml --limit managed_vps                 # upgrade + preview
+#   ansible-playbook update_and_reboot.yml --limit deploy-spice -e apply=true  # upgrade + reboot if needed
+#   ansible-playbook update_and_reboot.yml -e apply=true -e ui_report_path=/tmp/reboot.json
+
+- name: Patch packages
+  ansible.builtin.import_playbook: update.yml
+
+- name: Reboot what the patch left needing it
+  ansible.builtin.import_playbook: reboot.yml

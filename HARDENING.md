@@ -15,14 +15,44 @@ warnings without protecting against a same-network attacker. Operators
 who want real HTTPS have three good paths — pick the one that matches
 your network model.
 
-ufw already permits port 443 from the operator IP, so no firewall edit
-is needed for any of these.
+The installer doesn't open port 443 in `ufw` by default. After enabling
+HTTPS via any option below, open it:
 
-### Option A — Tailscale serve (recommended if you're on a tailnet)
+```sh
+# If you set an operator IP restriction:
+sudo ufw allow from <operator-ip> to any port 443 proto tcp
+# Or, for unrestricted 443 (uncommon — only if your operator IP is dynamic):
+sudo ufw allow 443/tcp
+```
 
-`tailscale serve` issues and renews a real cert via Tailscale's CA. Any
-operator with Tailscale installed sees a clean padlock — no warning.
-This is by far the lowest-friction path for the typical deployment.
+Once HTTPS is working, see [Enable `force_ssl` in UserSpice](#enable-force_ssl-in-userspice-after-https-is-up) below.
+
+### Option A — Let's Encrypt (public domain)
+
+If the LXC has a public DNS name and port 80 is reachable from the
+internet, or you can do DNS-01 with a supported provider, use certbot:
+
+```sh
+sudo apt install certbot python3-certbot-apache
+sudo certbot --apache -d ansible.example.com
+```
+
+certbot adds an SSL vhost on 443, sets up auto-renewal, and adds an
+80→443 redirect. The run-finish callback in `run_wrapper.sh` follows
+redirects and replays the POST body, so the certbot defaults work
+without further config.
+
+**DNS-01 with dynamic DNS:** providers like Cloudflare, deSEC, or Hurricane
+Electric work with `certbot --dns-cloudflare` / `--dns-rfc2136` and let
+you issue a cert without exposing port 80. Useful for home labs behind
+CGNAT.
+
+### Option B — Tailscale serve (tailnet)
+
+`tailscale serve` issues and renews a cert via **Tailscale's CA** (not
+Let's Encrypt — different ACME workflow, same end result of a real
+padlock for clients on your tailnet). The clean MagicDNS name
+(`<machine>.<tailnet>.ts.net`) just works.
 
 ```sh
 # Inside the LXC, after `tailscale up`:
@@ -30,25 +60,8 @@ sudo tailscale serve --bg https / http://localhost:80
 ```
 
 tailscaled terminates TLS on the tailnet IP and proxies to Apache on
-loopback:80. The Apache vhost stays as-is.
-
-### Option B — Let's Encrypt (real domain, port 80 reachable)
-
-If the LXC has a public DNS name and port 80 is reachable from the
-internet (or you can use DNS-01 with a supported provider), use certbot:
-
-```sh
-sudo apt install certbot python3-certbot-apache
-sudo certbot --apache -d ansible.example.com
-```
-
-certbot adds an SSL vhost on 443, sets up auto-renewal, and (by default)
-adds a redirect from 80 to 443. If you want to keep loopback traffic on
-plain HTTP — required because helper.php's run-finish callback hits
-`http://127.0.0.1/...` and run_wrapper.sh's curl doesn't follow
-redirects — answer "No redirect" when certbot asks, or edit the
-generated 80 vhost to add a `RewriteCond %{REMOTE_ADDR} !^127\.0\.0\.1$`
-guard.
+loopback:80. The Apache vhost stays as-is; you don't need to open 443
+in ufw because traffic arrives via the tailnet interface.
 
 ### Option C — Bring your own cert
 
@@ -78,9 +91,6 @@ Then write `/etc/apache2/sites-available/userspice-ansible-ssl.conf`:
 ```
 
 Then `sudo a2ensite userspice-ansible-ssl && sudo systemctl reload apache2`.
-Same caveat as Option B: keep port 80 working without forcing redirect,
-or guard the redirect with a loopback exemption, so the run-finish
-callback isn't broken.
 
 ## Multiple operator IPs
 
@@ -122,29 +132,35 @@ sudo ufw deny 22       # belt-and-suspenders even after sshd is off
 
 `pct enter <CTID>` from the Proxmox host then becomes your only console.
 
-## Don't enable UserSpice's `force_ssl` setting
+## Enable `force_ssl` in UserSpice (after HTTPS is up)
 
-The UserSpice admin → Security dashboard has a "Force HTTPS" toggle
-(it flips `settings.force_ssl` in the database to 1). **Leave it off**
-even after you've enabled HTTPS via one of the options above.
+Once you've added HTTPS via one of the options above, flip on
+UserSpice's belt-and-suspenders HTTPS enforcement:
 
-`force_ssl` adds a redirect at the PHP layer (in
-`users/includes/loader.php`) that fires on **every** request loading
-`users/init.php` — including the loopback callback the run-wrapper
-makes to `run_finish.php` after each playbook run. The wrapper's
-`curl` doesn't follow redirects, so `finished_at` on your audit rows
-stops getting stamped. Runs still complete, but the UI shows them as
-"running" forever.
+1. Log in as the admin user.
+2. **Admin Panel → Settings → Security** (or wherever your UserSpice
+   version exposes it).
+3. Toggle **Force HTTPS** on. (This flips `settings.force_ssl` in the
+   database to `1`.)
 
-The right place to enforce HTTPS is the Apache layer (or your reverse
-proxy / Tailscale serve). All three options above either don't redirect
-loopback or let you exempt it. The PHP-layer toggle has no exemption
-mechanism — it'll always break the callback.
+That adds a PHP-layer redirect in `users/includes/loader.php` so any
+request that somehow lands on plain HTTP — bookmark, hardcoded link,
+operator typing `http://` — gets bumped to HTTPS even if Apache misses
+it.
 
-If you absolutely need PHP-layer enforcement (say, you're running
-behind something that already terminates TLS and forwards plain HTTP),
-update `helper.php`'s `$finish_url` to use HTTPS and add `-k -L --post301`
-to `run_wrapper.sh`'s curl call.
+**Redundant with certbot's redirect?** Mostly yes. Certbot writes an
+Apache-layer 80→443 redirect that fires before PHP, so `force_ssl`
+mainly matters when something terminates TLS in front of Apache and
+forwards plain HTTP (e.g., a reverse proxy on the same LXC).
+Enabling it doesn't hurt — the second redirect never fires when the
+first already did its job.
+
+**Loopback callback:** `run_wrapper.sh`'s curl uses
+`-L --post301 --post302 --post303 -k`, so the run-finish callback at
+`http://127.0.0.1/...` correctly follows any redirect (Apache's or
+`force_ssl`'s) and replays the POST body. No further config needed.
+If you've forked `run_wrapper.sh` and removed those flags, expect
+audit rows stuck at "running" — re-add the flags.
 
 ## Self-managing the control node
 
